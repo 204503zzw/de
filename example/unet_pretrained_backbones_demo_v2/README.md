@@ -239,6 +239,16 @@ python train_segmentation.py ^
   - 二分类预测阈值
   - 多分类推理走 `argmax`，不依赖该阈值
 
+- `--pad`
+  - 启用后不缩放图像，直接将原图放到目标尺寸的画布上，不足处用黑色填充
+  - 保持原图像素的原始分辨率，避免缩放带来的失真
+  - 若原图某一边比目标大，则在该边裁剪后放入画布
+
+- `--pad-align`
+  - 填充时原图的对齐方式，需配合 `--pad` 使用
+  - `center`（默认）：原图居中放置，四周填充黑色
+  - `top_left`：原图放在左上角，右侧和下方填充黑色
+
 - 增广参数
   - `--hflip-prob`
   - `--vflip-prob`
@@ -299,6 +309,18 @@ python train_segmentation.py --arch DeepLabV3 --encoder-name resnet18 --encoder-
 
 ```powershell
 python train_segmentation.py --encoder-weights none
+```
+
+### 使用填充模式训练（不缩放原图）
+
+```powershell
+python train_segmentation.py --pad
+```
+
+### 填充时原图放在左上角
+
+```powershell
+python train_segmentation.py --pad --pad-align top_left
 ```
 
 ### 多类别分割
@@ -503,6 +525,19 @@ python infer_onnxruntime.py ^
   --input C:\path\to\image_or_dir ^
   --output-dir C:\path\to\output
 ```
+
+如果训练时使用了填充模式，推理时也需要加上对应参数：
+
+```powershell
+python infer_onnxruntime.py ^
+  --onnx C:\path\to\model.onnx ^
+  --input C:\path\to\image_or_dir ^
+  --output-dir C:\path\to\output ^
+  --pad ^
+  --pad-align top_left
+```
+
+注意：`infer_pytorch.py` 会自动从 checkpoint 读取 `pad` 和 `pad_align`，无需手动指定；`infer_onnxruntime.py` 需要手动传入。
 
 默认行为：
 
