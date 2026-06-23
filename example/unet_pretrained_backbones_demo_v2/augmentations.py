@@ -27,9 +27,11 @@ class TrainAugmentation:
         contrast_prob: float = 0.3,
         contrast_range: tuple[float, float] = (0.85, 1.15),
         pad: bool = False,
+        pad_align: str = "center",
     ):
         self.height, self.width = image_size
         self.pad = bool(pad)
+        self.pad_align = str(pad_align or "center").strip().lower()
         self.hflip_prob = hflip_prob
         self.vflip_prob = vflip_prob
         self.rotate90_prob = rotate90_prob
@@ -47,8 +49,8 @@ class TrainAugmentation:
 
     def _resize(self, image: Image.Image, mask: Image.Image) -> tuple[Image.Image, Image.Image]:
         if self.pad:
-            image, _ = pad_image(image, (self.height, self.width), fill=0)
-            mask, _ = pad_image(mask, (self.height, self.width), fill=0)
+            image, _ = pad_image(image, (self.height, self.width), fill=0, align=self.pad_align)
+            mask, _ = pad_image(mask, (self.height, self.width), fill=0, align=self.pad_align)
             return image, mask
         image = image.resize((self.width, self.height), Image.Resampling.BILINEAR)
         mask = mask.resize((self.width, self.height), Image.Resampling.NEAREST)
@@ -124,14 +126,15 @@ class TrainAugmentation:
 
 
 class EvalTransform:
-    def __init__(self, image_size: tuple[int, int], pad: bool = False):
+    def __init__(self, image_size: tuple[int, int], pad: bool = False, pad_align: str = "center"):
         self.height, self.width = image_size
         self.pad = bool(pad)
+        self.pad_align = str(pad_align or "center").strip().lower()
 
     def __call__(self, image: Image.Image, mask: Image.Image) -> tuple[Image.Image, Image.Image]:
         if self.pad:
-            image, _ = pad_image(image, (self.height, self.width), fill=0)
-            mask, _ = pad_image(mask, (self.height, self.width), fill=0)
+            image, _ = pad_image(image, (self.height, self.width), fill=0, align=self.pad_align)
+            mask, _ = pad_image(mask, (self.height, self.width), fill=0, align=self.pad_align)
             return image, mask
         image = image.resize((self.width, self.height), Image.Resampling.BILINEAR)
         mask = mask.resize((self.width, self.height), Image.Resampling.NEAREST)
