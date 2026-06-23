@@ -127,7 +127,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--pad", action="store_true",
-                        help="不缩放，直接把原图居中放到模型尺寸画布上、不足处用黑色填充")
+                        help="不缩放，直接把原图放到模型尺寸画布上、不足处用黑色填充")
+    parser.add_argument("--pad-align", type=str, default="center",
+                        choices=["center", "top_left"],
+                        help="填充时原图的对齐方式：center 居中，top_left 放在左上角")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -449,6 +452,7 @@ def build_dataloader(
     pin_memory: bool,
     transform,
     pad: bool = False,
+    pad_align: str = "center",
 ) -> DataLoader:
     dataset = SegmentationTxtDataset(
         images_dir=images_dir,
@@ -460,6 +464,7 @@ def build_dataloader(
         mask_values=mask_values,
         transform=transform,
         pad=pad,
+        pad_align=pad_align,
     )
     return DataLoader(
         dataset,
@@ -821,8 +826,9 @@ def main() -> None:
         contrast_prob=args.contrast_prob,
         contrast_range=(args.contrast_min, args.contrast_max),
         pad=args.pad,
+        pad_align=args.pad_align,
     )
-    val_transform = EvalTransform(image_size=image_size, pad=args.pad)
+    val_transform = EvalTransform(image_size=image_size, pad=args.pad, pad_align=args.pad_align)
 
     train_loader = build_dataloader(
         images_dir,
@@ -838,6 +844,7 @@ def main() -> None:
         pin_memory,
         train_transform,
         pad=args.pad,
+        pad_align=args.pad_align,
     )
     val_loader = build_dataloader(
         images_dir,
@@ -853,6 +860,7 @@ def main() -> None:
         pin_memory,
         val_transform,
         pad=args.pad,
+        pad_align=args.pad_align,
     )
 
     save_train_batches(train_loader, preprocessing, run_dir, args.max_visual_items)
@@ -884,6 +892,7 @@ def main() -> None:
         "model_config": model_config,
         "image_size": list(image_size),
         "pad": bool(args.pad),
+        "pad_align": str(args.pad_align),
         "batch_size": args.batch_size,
         "requested_batch_size": requested_batch_size,
         "auto_batch_fraction": auto_batch_fraction,
@@ -1010,6 +1019,7 @@ def main() -> None:
             single_cls=single_cls,
             num_classes=meta_num_classes,
             pad=args.pad,
+            pad_align=args.pad_align,
         )
 
         if val_iou > best_val_iou:
@@ -1028,6 +1038,7 @@ def main() -> None:
                 single_cls=single_cls,
                 num_classes=meta_num_classes,
                 pad=args.pad,
+                pad_align=args.pad_align,
             )
 
         if is_stop_requested(stop_signal_path):

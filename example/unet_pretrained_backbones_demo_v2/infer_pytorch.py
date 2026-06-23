@@ -58,6 +58,7 @@ def main() -> None:
     num_classes = int(checkpoint["model_config"]["num_classes"])
     preprocessing = checkpoint["preprocessing"]
     pad = bool(checkpoint.get("pad", False))
+    pad_align = str(checkpoint.get("pad_align", "center") or "center")
 
     input_images = list_input_images(args.input)
     if not input_images:
@@ -84,6 +85,7 @@ def main() -> None:
                 image_size=image_size,
                 preprocessing=preprocessing,
                 pad=pad,
+                pad_align=pad_align,
             )
             image_tensor = image_tensor.to(device)
 

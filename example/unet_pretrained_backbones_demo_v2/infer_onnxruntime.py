@@ -179,6 +179,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", nargs=2, type=int, default=None)
     parser.add_argument("--pad", action="store_true",
                         help="不缩放，直接把原图居中放到模型尺寸画布上、不足处用黑色填充（需配合 --imgsz 或固定输入尺寸的模型）")
+    parser.add_argument("--pad-align", type=str, default="center",
+                        choices=["center", "top_left"],
+                        help="填充时原图的对齐方式：center 居中，top_left 放在左上角")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--input-space", type=str, default="RGB")
     parser.add_argument("--input-range", nargs=2, type=float, default=[0.0, 1.0])
@@ -237,13 +240,14 @@ def prepare_input(
     mean: np.ndarray,
     std: np.ndarray,
     pad: bool = False,
+    pad_align: str = "center",
 ) -> tuple[np.ndarray, tuple[int, int], dict[str, int] | None]:
     image = Image.open(image_path).convert("L" if channels == 1 else "RGB")
     original_size = image.size
     pad_info: dict[str, int] | None = None
     if image_size is not None:
         if pad:
-            image, pad_info = pad_image(image, image_size, fill=0)
+            image, pad_info = pad_image(image, image_size, fill=0, align=pad_align)
         else:
             image = image.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR)
     image_array = np.asarray(image, dtype=np.float32)
@@ -269,19 +273,29 @@ def pad_image(
     image: Image.Image,
     size: tuple[int, int],
     fill: int = 0,
+    align: str = "center",
 ) -> tuple[Image.Image, dict[str, int]]:
-    """不缩放，直接将原图居中放到目标尺寸 (height, width) 的画布上，不足处填 fill。
+    """不缩放，直接将原图放到目标尺寸 (height, width) 的画布上，不足处填 fill。
 
-    若原图某一边比目标大，则在该边居中裁剪以放入画布。
+    若原图某一边比目标大，则在该边裁剪以放入画布。
+
+    Args:
+        align: "center" 居中放置，"top_left" 放在左上角
     """
     target_h, target_w = int(size[0]), int(size[1])
     orig_w, orig_h = image.size
     copy_w = min(orig_w, target_w)
     copy_h = min(orig_h, target_h)
-    src_left = (orig_w - copy_w) // 2
-    src_top = (orig_h - copy_h) // 2
-    pad_left = (target_w - copy_w) // 2
-    pad_top = (target_h - copy_h) // 2
+    if align == "top_left":
+        src_left = 0
+        src_top = 0
+        pad_left = 0
+        pad_top = 0
+    else:
+        src_left = (orig_w - copy_w) // 2
+        src_top = (orig_h - copy_h) // 2
+        pad_left = (target_w - copy_w) // 2
+        pad_top = (target_h - copy_h) // 2
     cropped = image.crop((src_left, src_top, src_left + copy_w, src_top + copy_h))
     canvas = Image.new(image.mode, (target_w, target_h), fill)
     canvas.paste(cropped, (pad_left, pad_top))
@@ -354,6 +368,7 @@ def main() -> None:
     input_space = str(args.input_space or "RGB").strip().upper()
     input_range = (float(args.input_range[0]), float(args.input_range[1]))
     pad = bool(args.pad) and image_size is not None
+    pad_align = str(args.pad_align or "center")
     if bool(args.pad) and image_size is None:
         print("Warning: --pad ignored because input size is dynamic; pass --imgsz to enable padding.")
 
@@ -372,6 +387,7 @@ def main() -> None:
             "input_space": input_space,
             "input_range": list(input_range),
             "pad": pad,
+            "pad_align": pad_align,
             "mean": mean.tolist(),
             "std": std.tolist(),
         },
@@ -387,6 +403,7 @@ def main() -> None:
             mean=mean,
             std=std,
             pad=pad,
+            pad_align=pad_align,
         )
         logits = session.run(None, {input_name: input_tensor})[0]
         mask, probability, runtime_num_classes = postprocess_output(logits, float(args.threshold))

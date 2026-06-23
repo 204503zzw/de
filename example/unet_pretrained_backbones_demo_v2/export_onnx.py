@@ -50,6 +50,7 @@ def main() -> None:
         "onnx_path": str(output_path),
         "image_size": checkpoint["image_size"],
         "pad": bool(checkpoint.get("pad", False)),
+        "pad_align": str(checkpoint.get("pad_align", "center") or "center"),
         "threshold": checkpoint.get("threshold", 0.5),
         "preprocessing": checkpoint["preprocessing"],
         "model_config": model_config,

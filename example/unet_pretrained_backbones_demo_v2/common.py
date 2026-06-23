@@ -403,19 +403,24 @@ def save_image_grid(tiles: list[np.ndarray], columns: int, output_path: str | Pa
     Image.fromarray(canvas).save(output_path)
 
 
+VALID_PAD_ALIGNS = ("center", "top_left")
+
+
 def pad_image(
     image: Image.Image,
     size: tuple[int, int],
     fill: int = 0,
+    align: str = "center",
 ) -> tuple[Image.Image, dict[str, int]]:
-    """不缩放，直接将原图居中放到目标尺寸的画布上，不足处用 fill 填充。
+    """不缩放，直接将原图放到目标尺寸的画布上，不足处用 fill 填充。
 
-    若原图某一边比目标大，则在该边居中裁剪以放入画布（纯填充无法容纳时的兜底）。
+    若原图某一边比目标大，则在该边裁剪以放入画布（纯填充无法容纳时的兜底）。
 
     Args:
         image: 输入 PIL 图像（保持原始分辨率，不缩放）
         size: 目标尺寸 (height, width)
         fill: 填充值，图像填 0（黑），mask 填 0（背景类）
+        align: 对齐方式，"center" 居中放置，"top_left" 放在左上角
 
     Returns:
         padded: 填充后的 PIL 图像，尺寸为 (width, height)
@@ -425,10 +430,17 @@ def pad_image(
     orig_w, orig_h = image.size
     copy_w = min(orig_w, target_w)
     copy_h = min(orig_h, target_h)
-    src_left = (orig_w - copy_w) // 2
-    src_top = (orig_h - copy_h) // 2
-    pad_left = (target_w - copy_w) // 2
-    pad_top = (target_h - copy_h) // 2
+
+    if align == "top_left":
+        src_left = 0
+        src_top = 0
+        pad_left = 0
+        pad_top = 0
+    else:
+        src_left = (orig_w - copy_w) // 2
+        src_top = (orig_h - copy_h) // 2
+        pad_left = (target_w - copy_w) // 2
+        pad_top = (target_h - copy_h) // 2
 
     cropped = image.crop((src_left, src_top, src_left + copy_w, src_top + copy_h))
     canvas = Image.new(image.mode, (target_w, target_h), fill)
@@ -705,6 +717,7 @@ class SegmentationTxtDataset(Dataset):
         mask_values: list[int] | None = None,
         transform=None,
         pad: bool = False,
+        pad_align: str = "center",
     ):
         self.samples = collect_split_pairs(images_dir, masks_dir, split_txt)
         self.height, self.width = image_size
@@ -713,6 +726,7 @@ class SegmentationTxtDataset(Dataset):
         self.mask_values = [int(x) for x in list(mask_values or [])] if mask_values else []
         self.transform = transform
         self.pad = bool(pad)
+        self.pad_align = str(pad_align or "center").strip().lower()
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -725,8 +739,8 @@ class SegmentationTxtDataset(Dataset):
         if self.transform is not None:
             image, mask = self.transform(image, mask)
         elif self.pad:
-            image, _ = pad_image(image, (self.height, self.width), fill=0)
-            mask, _ = pad_image(mask, (self.height, self.width), fill=0)
+            image, _ = pad_image(image, (self.height, self.width), fill=0, align=self.pad_align)
+            mask, _ = pad_image(mask, (self.height, self.width), fill=0, align=self.pad_align)
         else:
             image = image.resize((self.width, self.height), Image.Resampling.BILINEAR)
             mask = mask.resize((self.width, self.height), Image.Resampling.NEAREST)
@@ -853,12 +867,13 @@ def load_image_for_inference(
     image_size: tuple[int, int],
     preprocessing: dict[str, Any],
     pad: bool = False,
+    pad_align: str = "center",
 ) -> tuple[torch.Tensor, tuple[int, int], dict[str, int] | None]:
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
     pad_info: dict[str, int] | None = None
     if pad:
-        resized, pad_info = pad_image(image, image_size, fill=0)
+        resized, pad_info = pad_image(image, image_size, fill=0, align=pad_align)
     else:
         resized = image.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR)
     image_array = np.asarray(resized, dtype=np.float32)
@@ -976,6 +991,7 @@ def save_checkpoint(
     single_cls: bool = False,
     num_classes: int | None = None,
     pad: bool = False,
+    pad_align: str = "center",
 ) -> None:
     model_to_save = model.module if hasattr(model, "module") else model
     payload = {
@@ -990,6 +1006,7 @@ def save_checkpoint(
         "single_cls": bool(single_cls),
         "num_classes": int(num_classes) if num_classes is not None else None,
         "pad": bool(pad),
+        "pad_align": str(pad_align or "center"),
     }
     checkpoint_path = Path(checkpoint_path)
     ensure_dir(checkpoint_path.parent)
