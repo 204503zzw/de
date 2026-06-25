@@ -59,7 +59,7 @@ def _draw_metrics_on_image(image: Image.Image, metrics: dict[str, float]) -> Ima
         if k in ("TP", "FP", "FN", "TN"):
             continue
         lines.append(f"{k}: {v:.4f}")
-    text = "  ".join(lines)
+    text = "\n".join(lines)
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
