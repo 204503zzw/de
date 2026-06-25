@@ -78,6 +78,8 @@ def main() -> None:
                 threshold=threshold,
                 overlap_ratio=args.sahi_overlap,
                 device=device,
+                pad=pad,
+                pad_align=pad_align,
             )
         else:
             image_tensor, original_size, pad_info = load_image_for_inference(
