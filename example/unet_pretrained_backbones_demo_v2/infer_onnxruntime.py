@@ -621,8 +621,16 @@ def main() -> None:
                 output_path=output_dir / f"{stem}_overlay.png",
                 num_classes=int(runtime_num_classes),
                 alpha=args.overlay_alpha,
-                metrics=current_metrics,
             )
+            if current_metrics is not None:
+                save_overlay(
+                    image_path=image_path,
+                    mask=mask,
+                    output_path=output_dir / f"{stem}_overlay_metrics.png",
+                    num_classes=int(runtime_num_classes),
+                    alpha=args.overlay_alpha,
+                    metrics=current_metrics,
+                )
         print(f"Saved results for {image_path}")
 
     if gt_dir is not None and evaluated_count > 0:
