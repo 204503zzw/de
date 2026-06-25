@@ -1049,19 +1049,26 @@ def sahi_predict(
     threshold: float,
     overlap_ratio: float = 0.2,
     device: torch.device | str = "cpu",
+    pad: bool = False,
+    pad_align: str = "center",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """SAHI 滑窗推理：从原图按 crop_size 裁剪切片，resize 到 model_size 后推理，加权融合还原至原图尺寸。
+    """SAHI 滑窗推理：从原图按 crop_size 裁剪切片，送入模型后推理，加权融合还原至原图尺寸。
+
+    当 pad=True 时，每个裁片按训练时的填充方式放到 model_size 画布上（不缩放），
+    与训练预处理保持一致，避免位移；否则将裁片 resize 到 model_size。
 
     Args:
         model: 已加载的分割模型（eval 模式）
         image_path: 输入图像路径
         crop_size: 从原图裁剪的窗口大小 (height, width)，决定每次看多大的区域
-        model_size: 裁片 resize 后送入模型的尺寸 (height, width)，通常等于训练时的 image_size
+        model_size: 裁片送入模型的尺寸 (height, width)，通常等于训练时的 image_size
         preprocessing: 预处理参数字典
         num_classes: 类别数（1 表示二分类）
         threshold: 二分类概率阈值
         overlap_ratio: 相邻切片重叠比例，范围 [0, 1)，建议 0.1~0.3
         device: 推理设备
+        pad: 是否使用填充模式（与训练时一致），True 时不缩放裁片
+        pad_align: 填充对齐方式，"center" 或 "top_left"，需与训练时一致
 
     Returns:
         mask: 融合后的分割 mask，shape (H, W)，uint8
@@ -1095,9 +1102,13 @@ def sahi_predict(
             x1 = min(x0 + crop_w, orig_w)
 
             patch = image.crop((x0, y0, x1, y1))
-            patch_resized = patch.resize((model_w, model_h), Image.Resampling.BILINEAR)
+            if pad:
+                patch_input, patch_pad_info = pad_image(patch, model_size, fill=0, align=pad_align)
+            else:
+                patch_input = patch.resize((model_w, model_h), Image.Resampling.BILINEAR)
+                patch_pad_info = None
 
-            patch_array = np.asarray(patch_resized, dtype=np.float32)
+            patch_array = np.asarray(patch_input, dtype=np.float32)
             patch_array = preprocess_image_array(patch_array, preprocessing)
             patch_tensor = (
                 torch.from_numpy(np.transpose(patch_array, (2, 0, 1)))
@@ -1114,21 +1125,35 @@ def sahi_predict(
 
             if num_classes == 1:
                 prob = torch.sigmoid(logits).squeeze().cpu().numpy().astype(np.float32)
-                prob_resized = np.asarray(
-                    Image.fromarray(prob).resize((actual_w, actual_h), Image.Resampling.BILINEAR),
-                    dtype=np.float64,
-                )
-                accum[y0:y1, x0:x1] += prob_resized
+                if patch_pad_info is not None:
+                    pl = patch_pad_info["pad_left"]
+                    pt = patch_pad_info["pad_top"]
+                    cw = patch_pad_info["copy_w"]
+                    ch = patch_pad_info["copy_h"]
+                    prob_region = prob[pt : pt + ch, pl : pl + cw].astype(np.float64)
+                else:
+                    prob_region = np.asarray(
+                        Image.fromarray(prob).resize((actual_w, actual_h), Image.Resampling.BILINEAR),
+                        dtype=np.float64,
+                    )
+                accum[y0:y1, x0:x1] += prob_region
             else:
                 prob = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
                 for c in range(num_classes):
-                    ch_resized = np.asarray(
-                        Image.fromarray(prob[c].astype(np.float32)).resize(
-                            (actual_w, actual_h), Image.Resampling.BILINEAR
-                        ),
-                        dtype=np.float64,
-                    )
-                    accum[c, y0:y1, x0:x1] += ch_resized
+                    if patch_pad_info is not None:
+                        pl = patch_pad_info["pad_left"]
+                        pt = patch_pad_info["pad_top"]
+                        cw = patch_pad_info["copy_w"]
+                        ch = patch_pad_info["copy_h"]
+                        ch_region = prob[c][pt : pt + ch, pl : pl + cw].astype(np.float64)
+                    else:
+                        ch_region = np.asarray(
+                            Image.fromarray(prob[c].astype(np.float32)).resize(
+                                (actual_w, actual_h), Image.Resampling.BILINEAR
+                            ),
+                            dtype=np.float64,
+                        )
+                    accum[c, y0:y1, x0:x1] += ch_region
 
             weight[y0:y1, x0:x1] += 1.0
 

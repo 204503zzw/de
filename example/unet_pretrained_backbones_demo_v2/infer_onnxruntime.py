@@ -182,6 +182,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pad-align", type=str, default="center",
                         choices=["center", "top_left"],
                         help="填充时原图的对齐方式：center 居中，top_left 放在左上角")
+    parser.add_argument("--dynamic", action="store_true",
+                        help="动态推理：保持原图尺寸，仅填充到 stride 的倍数后推理，避免 resize 变形")
+    parser.add_argument("--stride", type=int, default=32,
+                        help="动态推理时的对齐步长（默认 32，适合 UNet 等 5 层下采样架构）")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--input-space", type=str, default="RGB")
     parser.add_argument("--input-range", nargs=2, type=float, default=[0.0, 1.0])
@@ -231,6 +235,27 @@ def resolve_session_config(session, args: argparse.Namespace) -> tuple[str, tupl
     return input_meta.name, image_size, channels, output_channels, mean, std
 
 
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    """将 value 向上取整到 multiple 的倍数。"""
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _pad_to_stride(image: Image.Image, stride: int) -> tuple[Image.Image, dict[str, int]]:
+    """将图像右侧和下侧填充到 stride 的倍数，不缩放。"""
+    orig_w, orig_h = image.size
+    target_w = _ceil_to_multiple(orig_w, stride)
+    target_h = _ceil_to_multiple(orig_h, stride)
+    if target_w == orig_w and target_h == orig_h:
+        pad_info = {"pad_left": 0, "pad_top": 0, "src_left": 0, "src_top": 0,
+                    "copy_w": orig_w, "copy_h": orig_h}
+        return image, pad_info
+    canvas = Image.new(image.mode, (target_w, target_h), 0)
+    canvas.paste(image, (0, 0))
+    pad_info = {"pad_left": 0, "pad_top": 0, "src_left": 0, "src_top": 0,
+                "copy_w": orig_w, "copy_h": orig_h}
+    return canvas, pad_info
+
+
 def prepare_input(
     image_path: str | Path,
     image_size: tuple[int, int] | None,
@@ -241,11 +266,15 @@ def prepare_input(
     std: np.ndarray,
     pad: bool = False,
     pad_align: str = "center",
+    dynamic: bool = False,
+    stride: int = 32,
 ) -> tuple[np.ndarray, tuple[int, int], dict[str, int] | None]:
     image = Image.open(image_path).convert("L" if channels == 1 else "RGB")
     original_size = image.size
     pad_info: dict[str, int] | None = None
-    if image_size is not None:
+    if dynamic:
+        image, pad_info = _pad_to_stride(image, stride)
+    elif image_size is not None:
         if pad:
             image, pad_info = pad_image(image, image_size, fill=0, align=pad_align)
         else:
@@ -367,9 +396,11 @@ def main() -> None:
     input_name, image_size, channels, output_channels, mean, std = resolve_session_config(session, args)
     input_space = str(args.input_space or "RGB").strip().upper()
     input_range = (float(args.input_range[0]), float(args.input_range[1]))
+    dynamic = bool(args.dynamic)
+    stride = int(args.stride)
     pad = bool(args.pad) and image_size is not None
     pad_align = str(args.pad_align or "center")
-    if bool(args.pad) and image_size is None:
+    if bool(args.pad) and image_size is None and not dynamic:
         print("Warning: --pad ignored because input size is dynamic; pass --imgsz to enable padding.")
 
     input_images = list_input_images(args.input)
@@ -386,6 +417,8 @@ def main() -> None:
             "threshold": float(args.threshold),
             "input_space": input_space,
             "input_range": list(input_range),
+            "dynamic": dynamic,
+            "stride": stride,
             "pad": pad,
             "pad_align": pad_align,
             "mean": mean.tolist(),
@@ -404,6 +437,8 @@ def main() -> None:
             std=std,
             pad=pad,
             pad_align=pad_align,
+            dynamic=dynamic,
+            stride=stride,
         )
         logits = session.run(None, {input_name: input_tensor})[0]
         mask, probability, runtime_num_classes = postprocess_output(logits, float(args.threshold))
