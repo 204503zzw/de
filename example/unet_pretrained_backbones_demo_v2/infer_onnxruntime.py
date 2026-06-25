@@ -1,8 +1,9 @@
 import argparse
+import csv
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -46,6 +47,31 @@ def _compute_edge(fg: np.ndarray, thickness: int = 2) -> np.ndarray:
     return fg & ~eroded
 
 
+def _draw_metrics_on_image(image: Image.Image, metrics: dict[str, float]) -> Image.Image:
+    """在图像左上角绘制精度指标文本（半透明黑底白字）。"""
+    draw = ImageDraw.Draw(image, "RGBA")
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    except (IOError, OSError):
+        font = ImageFont.load_default()
+    lines = []
+    for k, v in metrics.items():
+        if k in ("TP", "FP", "FN", "TN"):
+            continue
+        lines.append(f"{k}: {v:.4f}")
+    text = "  ".join(lines)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    padding = 6
+    draw.rectangle(
+        [(0, 0), (text_w + padding * 2, text_h + padding * 2)],
+        fill=(0, 0, 0, 180),
+    )
+    draw.text((padding, padding), text, fill=(255, 255, 255, 255), font=font)
+    return image
+
+
 def save_overlay(
     image_path: str | Path,
     mask: np.ndarray,
@@ -53,6 +79,7 @@ def save_overlay(
     num_classes: int = 1,
     color: tuple[int, int, int] = (220, 80, 100),
     alpha: float = 0.45,
+    metrics: dict[str, float] | None = None,
 ) -> None:
     _PALETTE = [
         (220,  80, 100),
@@ -87,7 +114,10 @@ def save_overlay(
             edge = _compute_edge(fg)
             for c in range(3):
                 overlay[:, :, c] = np.where(edge, overlay[:, :, c] * (1 - edge_alpha) + col[c] * edge_alpha, overlay[:, :, c])
-    Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)).save(output_path)
+    result = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
+    if metrics is not None:
+        result = _draw_metrics_on_image(result, metrics)
+    result.save(output_path)
 
 
 def _shape_dim_to_int(value) -> int | None:
@@ -198,7 +228,33 @@ def parse_args() -> argparse.Namespace:
                         help="叠加透明度，范围 (0, 1)，默认 0.45")
     parser.add_argument("--gt-dir", type=str, default=None,
                         help="Ground truth mask 目录，用于计算精度指标（IoU、Dice、Precision、Recall 等）")
+    parser.add_argument("--metrics-output", type=str, default=None,
+                        help="精度指标保存路径（CSV 文件），需配合 --gt-dir 使用")
     return parser.parse_args()
+
+
+def save_metrics_csv(
+    csv_path: str | Path,
+    per_image: list[tuple[str, dict[str, float]]],
+    summary: dict[str, dict[str, float]],
+) -> None:
+    """将每张图指标和汇总写入 CSV 文件。"""
+    csv_path = Path(csv_path)
+    ensure_dir(csv_path.parent)
+    if not per_image:
+        return
+    metric_keys = [k for k in per_image[0][1].keys() if k not in ("TP", "FP", "FN", "TN")]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image"] + metric_keys)
+        for name, m in per_image:
+            row = [name] + [f"{m.get(k, float('nan')):.6f}" for k in metric_keys]
+            writer.writerow(row)
+        writer.writerow([])
+        for label, m in summary.items():
+            row = [label] + [f"{m.get(k, float('nan')):.6f}" for k in metric_keys]
+            writer.writerow(row)
+    print(f"Metrics saved to {csv_path}")
 
 
 def load_gt_mask(gt_dir: Path, stem: str) -> np.ndarray | None:
@@ -502,7 +558,7 @@ def main() -> None:
     global_fp = 0.0
     global_fn = 0.0
     global_tn = 0.0
-    per_image_metrics: list[dict[str, float]] = []
+    per_image_metrics: list[tuple[str, dict[str, float]]] = []
     evaluated_count = 0
 
     for image_path in input_images:
@@ -532,15 +588,8 @@ def main() -> None:
         save_mask(mask, output_dir / f"{stem}_mask.png")
         if args.save_prob or int(runtime_num_classes) == 1:
             save_mask(probability, output_dir / f"{stem}_prob.png")
-        if args.overlay:
-            save_overlay(
-                image_path=image_path,
-                mask=mask,
-                output_path=output_dir / f"{stem}_overlay.png",
-                num_classes=int(runtime_num_classes),
-                alpha=args.overlay_alpha,
-            )
 
+        current_metrics: dict[str, float] | None = None
         if gt_dir is not None:
             gt_mask = load_gt_mask(gt_dir, stem)
             if gt_mask is not None:
@@ -552,24 +601,35 @@ def main() -> None:
                         dtype=np.uint8,
                     )
                 if int(runtime_num_classes) == 1:
-                    m = compute_binary_metrics(mask, gt_mask)
-                    global_tp += m["TP"]
-                    global_fp += m["FP"]
-                    global_fn += m["FN"]
-                    global_tn += m["TN"]
+                    current_metrics = compute_binary_metrics(mask, gt_mask)
+                    global_tp += current_metrics["TP"]
+                    global_fp += current_metrics["FP"]
+                    global_fn += current_metrics["FN"]
+                    global_tn += current_metrics["TN"]
                 else:
-                    m = compute_multiclass_metrics(mask, gt_mask, int(runtime_num_classes))
-                per_image_metrics.append(m)
+                    current_metrics = compute_multiclass_metrics(mask, gt_mask, int(runtime_num_classes))
+                per_image_metrics.append((stem, current_metrics))
                 evaluated_count += 1
-                print_metrics(m, prefix=f"[{stem}] ")
+                print_metrics(current_metrics, prefix=f"[{stem}] ")
             else:
                 print(f"[{stem}] Warning: no ground truth found, skipping evaluation")
+
+        if args.overlay:
+            save_overlay(
+                image_path=image_path,
+                mask=mask,
+                output_path=output_dir / f"{stem}_overlay.png",
+                num_classes=int(runtime_num_classes),
+                alpha=args.overlay_alpha,
+                metrics=current_metrics,
+            )
         print(f"Saved results for {image_path}")
 
     if gt_dir is not None and evaluated_count > 0:
         print(f"\n{'=' * 60}")
         print(f"Evaluation Summary ({evaluated_count} images)")
         print(f"{'=' * 60}")
+        summary: dict[str, dict[str, float]] = {}
         num_classes_final = int(runtime_num_classes) if 'runtime_num_classes' in dir() else 1
         if num_classes_final == 1:
             total = global_tp + global_fp + global_fn + global_tn
@@ -580,21 +640,29 @@ def main() -> None:
                 "Recall": global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else float("nan"),
                 "Accuracy": (global_tp + global_tn) / total if total > 0 else float("nan"),
             }
+            summary["Global"] = global_results
             print("[Global (pixel-level)]")
             print_metrics(global_results, prefix="  ")
-        mean_metrics: dict[str, list[float]] = {}
-        for m in per_image_metrics:
+        mean_metrics_agg: dict[str, list[float]] = {}
+        for _, m in per_image_metrics:
             for k, v in m.items():
                 if k in ("TP", "FP", "FN", "TN"):
                     continue
                 if v == v:  # not nan
-                    mean_metrics.setdefault(k, []).append(v)
+                    mean_metrics_agg.setdefault(k, []).append(v)
+        mean_results: dict[str, float] = {}
         print("[Mean (per-image average)]")
         parts = []
-        for k, values in mean_metrics.items():
-            parts.append(f"{k}={sum(values) / len(values):.4f}")
+        for k, values in mean_metrics_agg.items():
+            avg = sum(values) / len(values)
+            mean_results[k] = avg
+            parts.append(f"{k}={avg:.4f}")
         print(f"  {' | '.join(parts)}")
         print(f"{'=' * 60}")
+        summary["Mean"] = mean_results
+
+        if args.metrics_output:
+            save_metrics_csv(args.metrics_output, per_image_metrics, summary)
 
 
 if __name__ == "__main__":
