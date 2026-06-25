@@ -919,6 +919,31 @@ def _compute_edge(fg: np.ndarray, thickness: int = 2) -> np.ndarray:
     return fg & ~eroded
 
 
+def _draw_metrics_on_image(image: Image.Image, metrics: dict[str, float]) -> Image.Image:
+    """在图像左上角绘制精度指标文本（半透明黑底白字）。"""
+    draw = ImageDraw.Draw(image, "RGBA")
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    except (IOError, OSError):
+        font = ImageFont.load_default()
+    lines = []
+    for k, v in metrics.items():
+        if k in ("TP", "FP", "FN", "TN"):
+            continue
+        lines.append(f"{k}: {v:.4f}")
+    text = "  ".join(lines)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    padding = 6
+    draw.rectangle(
+        [(0, 0), (text_w + padding * 2, text_h + padding * 2)],
+        fill=(0, 0, 0, 180),
+    )
+    draw.text((padding, padding), text, fill=(255, 255, 255, 255), font=font)
+    return image
+
+
 def save_overlay(
     image_path: str | Path,
     mask: np.ndarray,
@@ -926,6 +951,7 @@ def save_overlay(
     num_classes: int = 1,
     color: tuple[int, int, int] = (220, 80, 100),
     alpha: float = 0.45,
+    metrics: dict[str, float] | None = None,
 ) -> None:
     """将分割 mask 以半透明颜色叠加在原图上保存。
 
@@ -936,6 +962,7 @@ def save_overlay(
         num_classes: 类别数，1 表示二分类
         color: 二分类前景颜色 RGB，默认玫瑰红
         alpha: 叠加透明度，范围 (0, 1)，越大颜色越浓
+        metrics: 可选的精度指标字典，非 None 时将指标绘制在图片左上角
     """
     _PALETTE = [
         (220,  80, 100),
@@ -975,7 +1002,10 @@ def save_overlay(
             for c in range(3):
                 overlay[:, :, c] = np.where(edge, overlay[:, :, c] * (1 - edge_alpha) + col[c] * edge_alpha, overlay[:, :, c])
 
-    Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8)).save(output_path)
+    result = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
+    if metrics is not None:
+        result = _draw_metrics_on_image(result, metrics)
+    result.save(output_path)
 
 
 def save_checkpoint(

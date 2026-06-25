@@ -1,4 +1,5 @@
 import argparse
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -108,7 +109,32 @@ def parse_args() -> argparse.Namespace:
                         help="叠加透明度，范围 (0, 1)，默认 0.45")
     parser.add_argument("--gt-dir", type=str, default=None,
                         help="Ground truth mask 目录，用于计算精度指标（IoU、Dice、Precision、Recall 等）")
+    parser.add_argument("--metrics-output", type=str, default=None,
+                        help="精度指标保存路径（CSV 文件），需配合 --gt-dir 使用")
     return parser.parse_args()
+
+
+def save_metrics_csv(
+    csv_path: str | Path,
+    per_image: list[tuple[str, dict[str, float]]],
+    summary: dict[str, dict[str, float]],
+) -> None:
+    csv_path = Path(csv_path)
+    ensure_dir(csv_path.parent)
+    if not per_image:
+        return
+    metric_keys = [k for k in per_image[0][1].keys() if k not in ("TP", "FP", "FN", "TN")]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image"] + metric_keys)
+        for name, m in per_image:
+            row = [name] + [f"{m.get(k, float('nan')):.6f}" for k in metric_keys]
+            writer.writerow(row)
+        writer.writerow([])
+        for label, m in summary.items():
+            row = [label] + [f"{m.get(k, float('nan')):.6f}" for k in metric_keys]
+            writer.writerow(row)
+    print(f"Metrics saved to {csv_path}")
 
 
 def resolve_device(device_name: str) -> torch.device:
@@ -137,7 +163,7 @@ def main() -> None:
     global_fp = 0.0
     global_fn = 0.0
     global_tn = 0.0
-    per_image_metrics: list[dict[str, float]] = []
+    per_image_metrics: list[tuple[str, dict[str, float]]] = []
     evaluated_count = 0
 
     input_images = list_input_images(args.input)
@@ -185,15 +211,8 @@ def main() -> None:
         stem = Path(image_path).stem
         save_mask(mask, output_dir / f"{stem}_mask.png")
         save_mask(probability, output_dir / f"{stem}_prob.png")
-        if args.overlay:
-            save_overlay(
-                image_path=image_path,
-                mask=mask,
-                output_path=output_dir / f"{stem}_overlay.png",
-                num_classes=num_classes,
-                alpha=args.overlay_alpha,
-            )
 
+        current_metrics: dict[str, float] | None = None
         if gt_dir is not None:
             gt_mask = load_gt_mask(gt_dir, stem)
             if gt_mask is not None:
@@ -205,24 +224,35 @@ def main() -> None:
                         dtype=np.uint8,
                     )
                 if num_classes == 1:
-                    m = compute_binary_metrics(mask, gt_mask)
-                    global_tp += m["TP"]
-                    global_fp += m["FP"]
-                    global_fn += m["FN"]
-                    global_tn += m["TN"]
+                    current_metrics = compute_binary_metrics(mask, gt_mask)
+                    global_tp += current_metrics["TP"]
+                    global_fp += current_metrics["FP"]
+                    global_fn += current_metrics["FN"]
+                    global_tn += current_metrics["TN"]
                 else:
-                    m = compute_multiclass_metrics(mask, gt_mask, num_classes)
-                per_image_metrics.append(m)
+                    current_metrics = compute_multiclass_metrics(mask, gt_mask, num_classes)
+                per_image_metrics.append((stem, current_metrics))
                 evaluated_count += 1
-                print_metrics(m, prefix=f"[{stem}] ")
+                print_metrics(current_metrics, prefix=f"[{stem}] ")
             else:
                 print(f"[{stem}] Warning: no ground truth found, skipping evaluation")
+
+        if args.overlay:
+            save_overlay(
+                image_path=image_path,
+                mask=mask,
+                output_path=output_dir / f"{stem}_overlay.png",
+                num_classes=num_classes,
+                alpha=args.overlay_alpha,
+                metrics=current_metrics,
+            )
         print(f"Saved results for {image_path}")
 
     if gt_dir is not None and evaluated_count > 0:
         print(f"\n{'=' * 60}")
         print(f"Evaluation Summary ({evaluated_count} images)")
         print(f"{'=' * 60}")
+        summary: dict[str, dict[str, float]] = {}
         if num_classes == 1:
             total = global_tp + global_fp + global_fn + global_tn
             global_results = {
@@ -232,21 +262,29 @@ def main() -> None:
                 "Recall": global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else float("nan"),
                 "Accuracy": (global_tp + global_tn) / total if total > 0 else float("nan"),
             }
+            summary["Global"] = global_results
             print("[Global (pixel-level)]")
             print_metrics(global_results, prefix="  ")
-        mean_metrics: dict[str, list[float]] = {}
-        for m in per_image_metrics:
+        mean_metrics_agg: dict[str, list[float]] = {}
+        for _, m in per_image_metrics:
             for k, v in m.items():
                 if k in ("TP", "FP", "FN", "TN"):
                     continue
                 if v == v:  # not nan
-                    mean_metrics.setdefault(k, []).append(v)
+                    mean_metrics_agg.setdefault(k, []).append(v)
+        mean_results: dict[str, float] = {}
         print("[Mean (per-image average)]")
         parts = []
-        for k, values in mean_metrics.items():
-            parts.append(f"{k}={sum(values) / len(values):.4f}")
+        for k, values in mean_metrics_agg.items():
+            avg = sum(values) / len(values)
+            mean_results[k] = avg
+            parts.append(f"{k}={avg:.4f}")
         print(f"  {' | '.join(parts)}")
         print(f"{'=' * 60}")
+        summary["Mean"] = mean_results
+
+        if args.metrics_output:
+            save_metrics_csv(args.metrics_output, per_image_metrics, summary)
 
 
 if __name__ == "__main__":
