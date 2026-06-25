@@ -1,7 +1,9 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 
 from common import (
     ensure_dir,
@@ -15,6 +17,72 @@ from common import (
     save_overlay,
     unpad_mask,
 )
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def load_gt_mask(gt_dir: Path, stem: str) -> np.ndarray | None:
+    for ext in (".png", ".bmp", ".tif", ".tiff", ".jpg", ".jpeg", ".webp"):
+        gt_path = gt_dir / f"{stem}{ext}"
+        if gt_path.is_file():
+            gt = np.asarray(Image.open(gt_path).convert("L"), dtype=np.uint8)
+            return gt
+    return None
+
+
+def compute_binary_metrics(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
+    p = pred > 127
+    g = gt > 127
+    tp = float(np.sum(p & g))
+    fp = float(np.sum(p & ~g))
+    fn = float(np.sum(~p & g))
+    tn = float(np.sum(~p & ~g))
+    total = tp + fp + fn + tn
+    iou = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else float("nan")
+    dice = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else float("nan")
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    accuracy = (tp + tn) / total if total > 0 else float("nan")
+    return {
+        "IoU": iou, "Dice": dice, "Precision": precision,
+        "Recall": recall, "Accuracy": accuracy,
+        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+    }
+
+
+def compute_multiclass_metrics(pred: np.ndarray, gt: np.ndarray, num_classes: int) -> dict[str, float]:
+    total = float(pred.size)
+    correct = float(np.sum(pred == gt))
+    accuracy = correct / total if total > 0 else float("nan")
+    ious = []
+    dices = []
+    for c in range(num_classes):
+        p = pred == c
+        g = gt == c
+        inter = float(np.sum(p & g))
+        union = float(np.sum(p | g))
+        iou = inter / union if union > 0 else float("nan")
+        dice = 2 * inter / (float(np.sum(p)) + float(np.sum(g))) if (float(np.sum(p)) + float(np.sum(g))) > 0 else float("nan")
+        ious.append(iou)
+        dices.append(dice)
+    valid_ious = [v for v in ious if v == v]
+    valid_dices = [v for v in dices if v == v]
+    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else float("nan")
+    mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else float("nan")
+    result: dict[str, float] = {"mIoU": mean_iou, "mDice": mean_dice, "Accuracy": accuracy}
+    for c in range(num_classes):
+        result[f"IoU_c{c}"] = ious[c]
+        result[f"Dice_c{c}"] = dices[c]
+    return result
+
+
+def print_metrics(metrics: dict[str, float], prefix: str = "") -> None:
+    parts = []
+    for k, v in metrics.items():
+        if k in ("TP", "FP", "FN", "TN"):
+            continue
+        parts.append(f"{k}={v:.4f}")
+    print(f"{prefix}{' | '.join(parts)}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,6 +106,8 @@ def parse_args() -> argparse.Namespace:
                         help="额外保存 mask 叠加在原图上的可视化结果")
     parser.add_argument("--overlay-alpha", type=float, default=0.45,
                         help="叠加透明度，范围 (0, 1)，默认 0.45")
+    parser.add_argument("--gt-dir", type=str, default=None,
+                        help="Ground truth mask 目录，用于计算精度指标（IoU、Dice、Precision、Recall 等）")
     return parser.parse_args()
 
 
@@ -59,6 +129,16 @@ def main() -> None:
     preprocessing = checkpoint["preprocessing"]
     pad = bool(checkpoint.get("pad", False))
     pad_align = str(checkpoint.get("pad_align", "center") or "center")
+
+    gt_dir = Path(args.gt_dir) if args.gt_dir else None
+    if gt_dir is not None and not gt_dir.is_dir():
+        raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+    global_tp = 0.0
+    global_fp = 0.0
+    global_fn = 0.0
+    global_tn = 0.0
+    per_image_metrics: list[dict[str, float]] = []
+    evaluated_count = 0
 
     input_images = list_input_images(args.input)
     if not input_images:
@@ -113,7 +193,60 @@ def main() -> None:
                 num_classes=num_classes,
                 alpha=args.overlay_alpha,
             )
+
+        if gt_dir is not None:
+            gt_mask = load_gt_mask(gt_dir, stem)
+            if gt_mask is not None:
+                if gt_mask.shape != mask.shape:
+                    gt_mask = np.asarray(
+                        Image.fromarray(gt_mask).resize(
+                            (mask.shape[1], mask.shape[0]), Image.Resampling.NEAREST
+                        ),
+                        dtype=np.uint8,
+                    )
+                if num_classes == 1:
+                    m = compute_binary_metrics(mask, gt_mask)
+                    global_tp += m["TP"]
+                    global_fp += m["FP"]
+                    global_fn += m["FN"]
+                    global_tn += m["TN"]
+                else:
+                    m = compute_multiclass_metrics(mask, gt_mask, num_classes)
+                per_image_metrics.append(m)
+                evaluated_count += 1
+                print_metrics(m, prefix=f"[{stem}] ")
+            else:
+                print(f"[{stem}] Warning: no ground truth found, skipping evaluation")
         print(f"Saved results for {image_path}")
+
+    if gt_dir is not None and evaluated_count > 0:
+        print(f"\n{'=' * 60}")
+        print(f"Evaluation Summary ({evaluated_count} images)")
+        print(f"{'=' * 60}")
+        if num_classes == 1:
+            total = global_tp + global_fp + global_fn + global_tn
+            global_results = {
+                "IoU": global_tp / (global_tp + global_fp + global_fn) if (global_tp + global_fp + global_fn) > 0 else float("nan"),
+                "Dice": 2 * global_tp / (2 * global_tp + global_fp + global_fn) if (2 * global_tp + global_fp + global_fn) > 0 else float("nan"),
+                "Precision": global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else float("nan"),
+                "Recall": global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else float("nan"),
+                "Accuracy": (global_tp + global_tn) / total if total > 0 else float("nan"),
+            }
+            print("[Global (pixel-level)]")
+            print_metrics(global_results, prefix="  ")
+        mean_metrics: dict[str, list[float]] = {}
+        for m in per_image_metrics:
+            for k, v in m.items():
+                if k in ("TP", "FP", "FN", "TN"):
+                    continue
+                if v == v:  # not nan
+                    mean_metrics.setdefault(k, []).append(v)
+        print("[Mean (per-image average)]")
+        parts = []
+        for k, values in mean_metrics.items():
+            parts.append(f"{k}={sum(values) / len(values):.4f}")
+        print(f"  {' | '.join(parts)}")
+        print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
