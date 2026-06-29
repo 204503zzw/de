@@ -187,7 +187,7 @@ def main() -> None:
 
     if args.checkpoint:
         pytorch_model, checkpoint = load_pytorch_model(args.checkpoint, device)
-        image_size = tuple(checkpoint["image_size"])
+        image_size = tuple(args.imgsz) if args.imgsz is not None else tuple(checkpoint["image_size"])
         threshold = float(checkpoint.get("threshold", 0.5)) if args.threshold < 0 else args.threshold
         num_classes = int(checkpoint["model_config"]["num_classes"])
         preprocessing = checkpoint["preprocessing"]
