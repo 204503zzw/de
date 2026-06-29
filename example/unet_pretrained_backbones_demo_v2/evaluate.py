@@ -5,19 +5,18 @@
     # PyTorch checkpoint（固定尺寸，和训练验证一致）
     python evaluate.py --checkpoint /path/to/best.pth \
         --images-dir /path/to/images --masks-dir /path/to/masks \
-        --val-txt /path/to/val.txt --output-dir /path/to/eval_output
+        --val-txt /path/to/val.txt
 
     # ONNX 模型
     python evaluate.py --onnx /path/to/model.onnx \
         --images-dir /path/to/images --masks-dir /path/to/masks \
-        --val-txt /path/to/val.txt --output-dir /path/to/eval_output \
+        --val-txt /path/to/val.txt \
         --num-classes 1 --imgsz 640 640
 
     # 动态推理模式（保持原图尺寸，逐张验证）
     python evaluate.py --checkpoint /path/to/best.pth \
         --images-dir /path/to/images --masks-dir /path/to/masks \
-        --val-txt /path/to/val.txt --output-dir /path/to/eval_output \
-        --dynamic
+        --val-txt /path/to/val.txt --dynamic
 """
 
 import argparse
@@ -45,7 +44,6 @@ from common import (
     preprocess_image_array,
     resolve_encoder_weights,
     save_json,
-    save_overlay,
 )
 
 
@@ -160,13 +158,7 @@ def parse_args() -> argparse.Namespace:
 
     # 输出
     parser.add_argument("--output-dir", type=str, default=None,
-                        help="输出目录，保存 overlay 可视化和 JSON 结果")
-    parser.add_argument("--overlay", action="store_true", default=False,
-                        help="保存每张图的 overlay 可视化（需指定 --output-dir）")
-    parser.add_argument("--overlay-alpha", type=float, default=0.45,
-                        help="叠加透明度（默认 0.45）")
-    parser.add_argument("--save-masks", action="store_true", default=False,
-                        help="保存预测 mask 到 output-dir（需指定 --output-dir）")
+                        help="输出目录，保存 JSON 结果")
 
     return parser.parse_args()
 
@@ -266,7 +258,8 @@ def main() -> None:
         # 动态推理模式：逐张处理，保持原图尺寸
         # ==============================================================
         sample_pairs = collect_split_pairs(images_dir, masks_dir, val_txt)
-        print(f"\nValidation dataset: {len(sample_pairs)} samples (dynamic mode, stride={stride})")
+        sample_count = len(sample_pairs)
+        print(f"\nValidation dataset: {sample_count} samples (dynamic mode, stride={stride})")
         print(f"Device: {device}, AMP: {use_amp}")
 
         for idx, (image_path, mask_path) in enumerate(sample_pairs):
@@ -318,44 +311,8 @@ def main() -> None:
                 total_iou_sum += batch_iou
                 batch_count += 1
 
-                # 生成预测 mask（用于 overlay / 保存）
-                if num_classes == 1:
-                    probs = torch.sigmoid(logits).squeeze(0).squeeze(0).cpu().numpy()
-                    pred_full = (probs > threshold).astype(np.uint8)
-                else:
-                    pred_full = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-            else:
-                input_name = onnx_session.get_inputs()[0].name
-                outputs = onnx_session.run(None, {input_name: input_tensor.numpy()})
-                raw_logits = outputs[0]
-                if num_classes == 1:
-                    probs = 1.0 / (1.0 + np.exp(-raw_logits))
-                    probs = probs.squeeze(0).squeeze(0)
-                    pred_full = (probs > threshold).astype(np.uint8)
-                else:
-                    pred_full = np.argmax(raw_logits, axis=1).squeeze(0).astype(np.uint8)
-
-            # 裁回原图尺寸
-            pred_mask = pred_full[:orig_h, :orig_w]
-            sample_count += 1
-
-            if batch_count > 0:
-                print(f"[{idx + 1}/{len(sample_pairs)}] {stem}  "
+                print(f"[{idx + 1}/{sample_count}] {stem}  "
                       f"loss={batch_loss:.4f}  iou={batch_iou:.4f}")
-
-            # 保存 overlay
-            if args.overlay and output_dir is not None:
-                overlay_mask = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
-                save_overlay(
-                    image_path=image_path, mask=overlay_mask,
-                    output_path=output_dir / f"{stem}_overlay.png",
-                    num_classes=num_classes, alpha=args.overlay_alpha,
-                )
-
-            # 保存预测 mask
-            if args.save_masks and output_dir is not None:
-                mask_out = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
-                Image.fromarray(mask_out).save(output_dir / f"{stem}_mask.png")
 
     else:
         # ==============================================================
@@ -386,7 +343,8 @@ def main() -> None:
             persistent_workers=args.num_workers > 0,
         )
 
-        print(f"\nValidation dataset: {len(val_dataset)} samples, {len(val_loader)} batches")
+        sample_count = len(val_dataset)
+        print(f"\nValidation dataset: {sample_count} samples, {len(val_loader)} batches")
         print(f"Device: {device}, AMP: {use_amp}")
 
         try:
@@ -396,14 +354,12 @@ def main() -> None:
         except Exception:
             enable_live_progress = False
 
-        sample_index = 0
         iterator = tqdm(val_loader, total=len(val_loader), leave=True, disable=not enable_live_progress)
 
         for images, masks in iterator:
             images_device = images.to(device, non_blocking=True)
             masks_device = masks.to(device, non_blocking=True)
 
-            # 前向推理 + loss/IoU
             if pytorch_model is not None:
                 with torch.inference_mode():
                     autocast_enabled = use_amp and device.type == "cuda"
@@ -415,64 +371,6 @@ def main() -> None:
                 total_iou_sum += batch_iou
                 batch_count += 1
                 iterator.set_postfix(loss=f"{batch_loss:.4f}", IoU=f"{batch_iou:.4f}")
-
-                # 生成预测 mask（用于 overlay / 保存）
-                if args.overlay or args.save_masks:
-                    if num_classes == 1:
-                        probs = torch.sigmoid(logits).squeeze(1)
-                        preds = (probs > threshold).cpu().numpy().astype(np.uint8)
-                    else:
-                        preds = torch.argmax(logits, dim=1).cpu().numpy().astype(np.uint8)
-                else:
-                    preds = None
-            else:
-                input_name = onnx_session.get_inputs()[0].name
-                input_array = images.numpy().astype(np.float32)
-                outputs = onnx_session.run(None, {input_name: input_array})
-                raw_logits = outputs[0]
-                if num_classes == 1:
-                    onnx_probs = 1.0 / (1.0 + np.exp(-raw_logits))
-                    onnx_probs = onnx_probs.squeeze(1)
-                    preds = (onnx_probs > threshold).astype(np.uint8)
-                else:
-                    preds = np.argmax(raw_logits, axis=1).astype(np.uint8)
-
-            # 保存 overlay / mask
-            current_batch_size = images.shape[0]
-            if (args.overlay or args.save_masks) and output_dir is not None and preds is not None:
-                for i in range(current_batch_size):
-                    if sample_index >= len(val_dataset.samples):
-                        break
-                    image_path, _ = val_dataset.samples[sample_index]
-                    stem = image_path.stem
-                    pred_mask = preds[i]
-
-                    if args.overlay:
-                        orig_image = Image.open(image_path).convert("RGB")
-                        orig_w, orig_h = orig_image.size
-                        overlay_mask = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
-                        if overlay_mask.shape[0] != orig_h or overlay_mask.shape[1] != orig_w:
-                            overlay_mask = np.asarray(
-                                Image.fromarray(overlay_mask).resize(
-                                    (orig_w, orig_h), Image.Resampling.NEAREST
-                                ),
-                                dtype=np.uint8,
-                            )
-                        save_overlay(
-                            image_path=image_path, mask=overlay_mask,
-                            output_path=output_dir / f"{stem}_overlay.png",
-                            num_classes=num_classes, alpha=args.overlay_alpha,
-                        )
-
-                    if args.save_masks:
-                        mask_out = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
-                        Image.fromarray(mask_out).save(output_dir / f"{stem}_mask.png")
-
-                    sample_index += 1
-            else:
-                sample_index += current_batch_size
-
-            sample_count = sample_index
 
     elapsed = time.time() - started_at
 
