@@ -14,6 +14,12 @@
         --images-dir /path/to/images --masks-dir /path/to/masks \
         --val-txt /path/to/val.txt --output-dir /path/to/eval_output \
         --num-classes 1 --imgsz 640 640
+
+    # 动态推理模式（保持原图尺寸，逐张验证）
+    python evaluate.py --checkpoint /path/to/best.pth \
+        --images-dir /path/to/images --masks-dir /path/to/masks \
+        --val-txt /path/to/val.txt --output-dir /path/to/eval_output \
+        --dynamic
 """
 
 import argparse
@@ -32,6 +38,7 @@ from augmentations import EvalTransform
 from common import (
     SegmentationTxtDataset,
     build_model,
+    collect_split_pairs,
     compute_batch_iou,
     create_loss_function,
     ensure_dir,
@@ -133,6 +140,26 @@ def save_metrics_csv(
             row = [label] + [f"{m.get(k, float('nan')):.6f}" for k in metric_keys]
             writer.writerow(row)
     print(f"Metrics saved to {csv_path}")
+
+
+# ---------------------------------------------------------------------------
+# 动态推理辅助
+# ---------------------------------------------------------------------------
+
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _pad_to_stride(image: Image.Image, stride: int) -> tuple[Image.Image, tuple[int, int]]:
+    """将图像右侧和下侧填充到 stride 的倍数，返回 (填充后图像, 原始尺寸(w,h))。"""
+    orig_w, orig_h = image.size
+    target_w = _ceil_to_multiple(orig_w, stride)
+    target_h = _ceil_to_multiple(orig_h, stride)
+    if target_w == orig_w and target_h == orig_h:
+        return image, (orig_w, orig_h)
+    canvas = Image.new(image.mode, (target_w, target_h), 0)
+    canvas.paste(image, (0, 0))
+    return canvas, (orig_w, orig_h)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +289,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pad-align", type=str, default=None,
                         choices=["center", "top_left"],
                         help="填充对齐方式（PyTorch 从 checkpoint 自动读取）")
+    parser.add_argument("--dynamic", action="store_true",
+                        help="动态推理：保持原图尺寸，仅填充到 stride 的倍数后推理（逐张处理，无 batch）")
+    parser.add_argument("--stride", type=int, default=32,
+                        help="动态推理时的对齐步长（默认 32）")
 
     # 输出
     parser.add_argument("--output-dir", type=str, default=None,
@@ -320,8 +351,10 @@ def main() -> None:
             input_shape = onnx_session.get_inputs()[0].shape
             if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
                 image_size = (input_shape[2], input_shape[3])
+            elif args.dynamic:
+                image_size = None  # type: ignore[assignment]
             else:
-                raise ValueError("ONNX 模型输入尺寸为动态，请用 --imgsz H W 指定")
+                raise ValueError("ONNX 模型输入尺寸为动态，请用 --imgsz H W 指定或使用 --dynamic")
         else:
             image_size = tuple(args.imgsz)
         num_classes = args.num_classes if args.num_classes is not None else 1
@@ -332,11 +365,11 @@ def main() -> None:
         pad_align = args.pad_align if args.pad_align is not None else "center"
         mask_values = []
         print(f"Loaded ONNX model: {args.onnx}")
-        print(f"  image_size={list(image_size)} num_classes={num_classes} threshold={threshold:.4f}")
+        print(f"  image_size={list(image_size) if image_size else 'dynamic'} num_classes={num_classes} threshold={threshold:.4f}")
         print(f"  pad={pad} pad_align={pad_align}")
 
     # ------------------------------------------------------------------
-    # 构建验证数据集
+    # 数据准备
     # ------------------------------------------------------------------
     images_dir = Path(args.images_dir)
     masks_dir = Path(args.masks_dir)
@@ -347,33 +380,8 @@ def main() -> None:
     if meta_mask_values and not mask_values:
         mask_values = [int(x) for x in list(meta_mask_values)]
 
-    val_transform = EvalTransform(image_size=image_size, pad=pad, pad_align=pad_align)
-
-    val_dataset = SegmentationTxtDataset(
-        images_dir=images_dir,
-        masks_dir=masks_dir,
-        split_txt=val_txt,
-        image_size=image_size,
-        num_classes=num_classes,
-        preprocessing=preprocessing,
-        mask_values=mask_values,
-        transform=val_transform,
-        pad=pad,
-        pad_align=pad_align,
-    )
-
-    pin_memory = device.type == "cuda"
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    print(f"\nValidation dataset: {len(val_dataset)} samples, {len(val_loader)} batches")
-    print(f"Device: {device}, AMP: {use_amp}")
+    dynamic = bool(args.dynamic)
+    stride = int(args.stride)
 
     # ------------------------------------------------------------------
     # 输出目录
@@ -384,9 +392,8 @@ def main() -> None:
         metrics_csv_path = str(output_dir / "metrics.csv")
 
     # ------------------------------------------------------------------
-    # 验证循环
+    # 公共统计变量
     # ------------------------------------------------------------------
-    # 构建 loss 函数（仅 PyTorch 模式）
     loss_fn = create_loss_function(num_classes) if pytorch_model is not None else None
 
     global_tp = 0.0
@@ -397,116 +404,258 @@ def main() -> None:
     total_loss_sum = 0.0
     total_iou_sum = 0.0
     batch_count = 0
-    sample_index = 0
     started_at = time.time()
 
-    try:
-        enable_live_progress = bool(
-            getattr(getattr(__import__("sys"), "stderr", None), "isatty", lambda: False)()
-        )
-    except Exception:
-        enable_live_progress = False
+    if dynamic:
+        # ==============================================================
+        # 动态推理模式：逐张处理，保持原图尺寸
+        # ==============================================================
+        sample_pairs = collect_split_pairs(images_dir, masks_dir, val_txt)
+        print(f"\nValidation dataset: {len(sample_pairs)} samples (dynamic mode, stride={stride})")
+        print(f"Device: {device}, AMP: {use_amp}")
 
-    iterator = tqdm(val_loader, total=len(val_loader), leave=True, disable=not enable_live_progress)
-
-    for images, masks in iterator:
-        batch_size = images.shape[0]
-
-        # 前向推理
-        if pytorch_model is not None:
-            preds, logits = predict_batch_pytorch(pytorch_model, images, num_classes, threshold, device)
-            # 计算 loss 和 batch IoU（与训练时验证一致）
-            masks_device = masks.to(device, non_blocking=True)
-            with torch.inference_mode():
-                autocast_enabled = use_amp and device.type == "cuda"
-                with torch.autocast(device_type=device.type, enabled=autocast_enabled):
-                    batch_loss = float(loss_fn(logits, masks_device).item())
-            batch_iou = compute_batch_iou(logits.detach(), masks_device.detach(), num_classes, threshold)
-            total_loss_sum += batch_loss
-            total_iou_sum += batch_iou
-            batch_count += 1
-        else:
-            preds = predict_batch_onnx(onnx_session, images, num_classes, threshold)
-
-        # 逐样本计算指标
-        for i in range(batch_size):
-            if sample_index >= len(val_dataset.samples):
-                break
-
-            image_path, mask_path = val_dataset.samples[sample_index]
+        for idx, (image_path, mask_path) in enumerate(sample_pairs):
             stem = image_path.stem
 
-            pred_mask = preds[i]
+            # 加载原图 + GT mask
+            image = Image.open(image_path).convert("RGB")
+            gt_pil = Image.open(mask_path).convert("L")
+            orig_w, orig_h = image.size
+
+            # GT mask 处理
+            gt_array = np.asarray(gt_pil, dtype=np.uint8)
+            if gt_array.shape != (orig_h, orig_w):
+                gt_pil = gt_pil.resize((orig_w, orig_h), Image.Resampling.NEAREST)
+                gt_array = np.asarray(gt_pil, dtype=np.uint8)
+
+            # 图像填充到 stride 倍数
+            padded_image, (pw, ph) = _pad_to_stride(image, stride)
+
+            # 预处理
+            img_array = np.asarray(padded_image, dtype=np.float32)
+            img_array = preprocess_image_array(img_array, preprocessing)
+            input_tensor = torch.from_numpy(np.transpose(img_array, (2, 0, 1))).float().unsqueeze(0)
+
+            # 推理
+            if pytorch_model is not None:
+                input_device = input_tensor.to(device, non_blocking=True)
+                with torch.inference_mode():
+                    autocast_enabled = use_amp and device.type == "cuda"
+                    with torch.autocast(device_type=device.type, enabled=autocast_enabled):
+                        logits = pytorch_model(input_device)
+                if num_classes == 1:
+                    probs = torch.sigmoid(logits).squeeze(0).squeeze(0).cpu().numpy()
+                    pred_full = (probs > threshold).astype(np.uint8)
+                else:
+                    pred_full = torch.argmax(logits, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            else:
+                input_name = onnx_session.get_inputs()[0].name
+                outputs = onnx_session.run(None, {input_name: input_tensor.numpy()})
+                raw_logits = outputs[0]
+                if num_classes == 1:
+                    probs = 1.0 / (1.0 + np.exp(-raw_logits))
+                    probs = probs.squeeze(0).squeeze(0)
+                    pred_full = (probs > threshold).astype(np.uint8)
+                else:
+                    pred_full = np.argmax(raw_logits, axis=1).squeeze(0).astype(np.uint8)
+
+            # 裁回原图尺寸
+            pred_mask = pred_full[:orig_h, :orig_w]
+
+            # 计算 loss/IoU（PyTorch 模式，需构造对应的 GT tensor）
+            if pytorch_model is not None and loss_fn is not None:
+                gt_padded = np.zeros((padded_image.size[1], padded_image.size[0]), dtype=np.uint8)
+                gt_padded[:orig_h, :orig_w] = gt_array
+                if num_classes == 1:
+                    gt_tensor = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+                else:
+                    if mask_values:
+                        indexed = np.zeros(gt_padded.shape, dtype=np.int64)
+                        for ci, mv in enumerate(mask_values):
+                            indexed[gt_padded == mv] = ci
+                        gt_tensor = torch.from_numpy(indexed).unsqueeze(0).long().to(device)
+                    else:
+                        gt_tensor = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long().to(device)
+                with torch.inference_mode():
+                    autocast_enabled = use_amp and device.type == "cuda"
+                    with torch.autocast(device_type=device.type, enabled=autocast_enabled):
+                        batch_loss = float(loss_fn(logits, gt_tensor).item())
+                batch_iou = compute_batch_iou(logits.detach(), gt_tensor.detach(), num_classes, threshold)
+                total_loss_sum += batch_loss
+                total_iou_sum += batch_iou
+                batch_count += 1
+
+            # 逐图指标
             if num_classes == 1:
-                gt_mask = masks[i].squeeze(0).numpy()
-                gt_mask = (gt_mask > 0).astype(np.uint8)
-                pred_binary = pred_mask.astype(np.uint8)
-                current_metrics = compute_binary_metrics(pred_binary, gt_mask)
+                gt_binary = (gt_array > 127).astype(np.uint8)
+                current_metrics = compute_binary_metrics(pred_mask, gt_binary)
                 global_tp += current_metrics["TP"]
                 global_fp += current_metrics["FP"]
                 global_fn += current_metrics["FN"]
                 global_tn += current_metrics["TN"]
             else:
-                gt_mask = masks[i].numpy().astype(np.uint8)
-                current_metrics = compute_multiclass_metrics(pred_mask, gt_mask, num_classes)
+                if mask_values:
+                    gt_indexed = np.zeros(gt_array.shape, dtype=np.uint8)
+                    for ci, mv in enumerate(mask_values):
+                        gt_indexed[gt_array == mv] = ci
+                    current_metrics = compute_multiclass_metrics(pred_mask, gt_indexed, num_classes)
+                else:
+                    current_metrics = compute_multiclass_metrics(pred_mask, gt_array, num_classes)
 
             per_image_metrics.append((stem, current_metrics))
             print_metrics(current_metrics, prefix=f"[{stem}] ")
 
-            # 保存 overlay 可视化
+            # 保存 overlay
             if args.overlay and output_dir is not None:
-                # 还原预测 mask 到原图尺寸用于 overlay
-                orig_image = Image.open(image_path).convert("RGB")
-                orig_w, orig_h = orig_image.size
-
-                if num_classes == 1:
-                    overlay_mask = (pred_mask * 255).astype(np.uint8)
-                else:
-                    overlay_mask = pred_mask
-
-                if overlay_mask.shape[0] != orig_h or overlay_mask.shape[1] != orig_w:
-                    overlay_mask = np.asarray(
-                        Image.fromarray(overlay_mask).resize(
-                            (orig_w, orig_h), Image.Resampling.NEAREST
-                        ),
-                        dtype=np.uint8,
-                    )
-
+                overlay_mask = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
                 save_overlay(
-                    image_path=image_path,
-                    mask=overlay_mask,
+                    image_path=image_path, mask=overlay_mask,
                     output_path=output_dir / f"{stem}_overlay.png",
-                    num_classes=num_classes,
-                    alpha=args.overlay_alpha,
+                    num_classes=num_classes, alpha=args.overlay_alpha,
                 )
                 save_overlay(
-                    image_path=image_path,
-                    mask=overlay_mask,
+                    image_path=image_path, mask=overlay_mask,
                     output_path=output_dir / f"{stem}_overlay_metrics.png",
-                    num_classes=num_classes,
-                    alpha=args.overlay_alpha,
+                    num_classes=num_classes, alpha=args.overlay_alpha,
                     metrics=current_metrics,
                 )
 
             # 保存预测 mask
             if args.save_masks and output_dir is not None:
+                mask_out = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
+                Image.fromarray(mask_out).save(output_dir / f"{stem}_mask.png")
+
+    else:
+        # ==============================================================
+        # 固定尺寸模式：使用 DataLoader 批量验证
+        # ==============================================================
+        val_transform = EvalTransform(image_size=image_size, pad=pad, pad_align=pad_align)
+
+        val_dataset = SegmentationTxtDataset(
+            images_dir=images_dir,
+            masks_dir=masks_dir,
+            split_txt=val_txt,
+            image_size=image_size,
+            num_classes=num_classes,
+            preprocessing=preprocessing,
+            mask_values=mask_values,
+            transform=val_transform,
+            pad=pad,
+            pad_align=pad_align,
+        )
+
+        pin_memory = device.type == "cuda"
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=args.num_workers > 0,
+        )
+
+        print(f"\nValidation dataset: {len(val_dataset)} samples, {len(val_loader)} batches")
+        print(f"Device: {device}, AMP: {use_amp}")
+
+        try:
+            enable_live_progress = bool(
+                getattr(getattr(__import__("sys"), "stderr", None), "isatty", lambda: False)()
+            )
+        except Exception:
+            enable_live_progress = False
+
+        sample_index = 0
+        iterator = tqdm(val_loader, total=len(val_loader), leave=True, disable=not enable_live_progress)
+
+        for images, masks in iterator:
+            current_batch_size = images.shape[0]
+
+            # 前向推理
+            if pytorch_model is not None:
+                preds, logits = predict_batch_pytorch(pytorch_model, images, num_classes, threshold, device)
+                masks_device = masks.to(device, non_blocking=True)
+                with torch.inference_mode():
+                    autocast_enabled = use_amp and device.type == "cuda"
+                    with torch.autocast(device_type=device.type, enabled=autocast_enabled):
+                        batch_loss = float(loss_fn(logits, masks_device).item())
+                batch_iou = compute_batch_iou(logits.detach(), masks_device.detach(), num_classes, threshold)
+                total_loss_sum += batch_loss
+                total_iou_sum += batch_iou
+                batch_count += 1
+            else:
+                preds = predict_batch_onnx(onnx_session, images, num_classes, threshold)
+
+            # 逐样本计算指标
+            for i in range(current_batch_size):
+                if sample_index >= len(val_dataset.samples):
+                    break
+
+                image_path, mask_path = val_dataset.samples[sample_index]
+                stem = image_path.stem
+
+                pred_mask = preds[i]
                 if num_classes == 1:
-                    save_mask = (pred_mask * 255).astype(np.uint8)
+                    gt_mask = masks[i].squeeze(0).numpy()
+                    gt_mask = (gt_mask > 0).astype(np.uint8)
+                    pred_binary = pred_mask.astype(np.uint8)
+                    current_metrics = compute_binary_metrics(pred_binary, gt_mask)
+                    global_tp += current_metrics["TP"]
+                    global_fp += current_metrics["FP"]
+                    global_fn += current_metrics["FN"]
+                    global_tn += current_metrics["TN"]
                 else:
-                    save_mask = pred_mask
-                Image.fromarray(save_mask).save(output_dir / f"{stem}_mask.png")
+                    gt_mask = masks[i].numpy().astype(np.uint8)
+                    current_metrics = compute_multiclass_metrics(pred_mask, gt_mask, num_classes)
 
-            sample_index += 1
+                per_image_metrics.append((stem, current_metrics))
+                print_metrics(current_metrics, prefix=f"[{stem}] ")
 
-        # 更新进度条
-        if pytorch_model is not None and batch_count > 0:
-            avg_loss = total_loss_sum / batch_count
-            avg_iou = total_iou_sum / batch_count
-            iterator.set_postfix(loss=f"{avg_loss:.4f}", IoU=f"{avg_iou:.4f}")
-        elif per_image_metrics:
-            last_metrics = per_image_metrics[-1][1]
-            display_iou = last_metrics.get("IoU", last_metrics.get("mIoU", 0.0))
-            iterator.set_postfix(IoU=f"{display_iou:.4f}")
+                # 保存 overlay 可视化
+                if args.overlay and output_dir is not None:
+                    orig_image = Image.open(image_path).convert("RGB")
+                    orig_w, orig_h = orig_image.size
+
+                    if num_classes == 1:
+                        overlay_mask = (pred_mask * 255).astype(np.uint8)
+                    else:
+                        overlay_mask = pred_mask
+
+                    if overlay_mask.shape[0] != orig_h or overlay_mask.shape[1] != orig_w:
+                        overlay_mask = np.asarray(
+                            Image.fromarray(overlay_mask).resize(
+                                (orig_w, orig_h), Image.Resampling.NEAREST
+                            ),
+                            dtype=np.uint8,
+                        )
+
+                    save_overlay(
+                        image_path=image_path, mask=overlay_mask,
+                        output_path=output_dir / f"{stem}_overlay.png",
+                        num_classes=num_classes, alpha=args.overlay_alpha,
+                    )
+                    save_overlay(
+                        image_path=image_path, mask=overlay_mask,
+                        output_path=output_dir / f"{stem}_overlay_metrics.png",
+                        num_classes=num_classes, alpha=args.overlay_alpha,
+                        metrics=current_metrics,
+                    )
+
+                # 保存预测 mask
+                if args.save_masks and output_dir is not None:
+                    mask_out = (pred_mask * 255).astype(np.uint8) if num_classes == 1 else pred_mask
+                    Image.fromarray(mask_out).save(output_dir / f"{stem}_mask.png")
+
+                sample_index += 1
+
+            # 更新进度条
+            if pytorch_model is not None and batch_count > 0:
+                avg_loss = total_loss_sum / batch_count
+                avg_iou = total_iou_sum / batch_count
+                iterator.set_postfix(loss=f"{avg_loss:.4f}", IoU=f"{avg_iou:.4f}")
+            elif per_image_metrics:
+                last_metrics = per_image_metrics[-1][1]
+                display_iou = last_metrics.get("IoU", last_metrics.get("mIoU", 0.0))
+                iterator.set_postfix(IoU=f"{display_iou:.4f}")
 
     elapsed = time.time() - started_at
     evaluated_count = len(per_image_metrics)
@@ -568,15 +717,19 @@ def main() -> None:
         eval_summary: dict[str, Any] = {
             "evaluated_count": evaluated_count,
             "elapsed_seconds": elapsed,
-            "image_size": list(image_size),
             "num_classes": num_classes,
             "threshold": threshold,
-            "pad": pad,
-            "pad_align": pad_align,
+            "dynamic": dynamic,
             "val_loss": val_loss,
             "val_iou": val_iou,
             "summary": {k: {mk: float(mv) for mk, mv in v.items()} for k, v in summary.items()},
         }
+        if dynamic:
+            eval_summary["stride"] = stride
+        else:
+            eval_summary["image_size"] = list(image_size)
+            eval_summary["pad"] = pad
+            eval_summary["pad_align"] = pad_align
         if args.checkpoint:
             eval_summary["checkpoint"] = str(args.checkpoint)
         else:
