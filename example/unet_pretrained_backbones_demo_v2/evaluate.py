@@ -32,6 +32,8 @@ from augmentations import EvalTransform
 from common import (
     SegmentationTxtDataset,
     build_model,
+    compute_batch_iou,
+    create_loss_function,
     ensure_dir,
     get_preprocessing_config,
     load_checkpoint,
@@ -177,8 +179,8 @@ def predict_batch_pytorch(
     num_classes: int,
     threshold: float,
     device: torch.device,
-) -> np.ndarray:
-    """PyTorch 批量前向推理，返回 (B, H, W) 的预测 mask。"""
+) -> tuple[np.ndarray, torch.Tensor]:
+    """PyTorch 批量前向推理，返回 (预测 mask (B,H,W), logits tensor)。"""
     images = images.to(device, non_blocking=True)
     with torch.inference_mode():
         logits = model(images)
@@ -187,7 +189,7 @@ def predict_batch_pytorch(
         preds = (probs > threshold).cpu().numpy().astype(np.uint8)
     else:
         preds = torch.argmax(logits, dim=1).cpu().numpy().astype(np.uint8)
-    return preds
+    return preds, logits
 
 
 def predict_batch_onnx(
@@ -384,6 +386,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 验证循环
     # ------------------------------------------------------------------
+    # 构建 loss 函数（仅 PyTorch 模式）
+    loss_fn = create_loss_function(num_classes) if pytorch_model is not None else None
+
     global_tp = 0.0
     global_fp = 0.0
     global_fn = 0.0
@@ -391,6 +396,7 @@ def main() -> None:
     per_image_metrics: list[tuple[str, dict[str, float]]] = []
     total_loss_sum = 0.0
     total_iou_sum = 0.0
+    batch_count = 0
     sample_index = 0
     started_at = time.time()
 
@@ -408,7 +414,17 @@ def main() -> None:
 
         # 前向推理
         if pytorch_model is not None:
-            preds = predict_batch_pytorch(pytorch_model, images, num_classes, threshold, device)
+            preds, logits = predict_batch_pytorch(pytorch_model, images, num_classes, threshold, device)
+            # 计算 loss 和 batch IoU（与训练时验证一致）
+            masks_device = masks.to(device, non_blocking=True)
+            with torch.inference_mode():
+                autocast_enabled = use_amp and device.type == "cuda"
+                with torch.autocast(device_type=device.type, enabled=autocast_enabled):
+                    batch_loss = float(loss_fn(logits, masks_device).item())
+            batch_iou = compute_batch_iou(logits.detach(), masks_device.detach(), num_classes, threshold)
+            total_loss_sum += batch_loss
+            total_iou_sum += batch_iou
+            batch_count += 1
         else:
             preds = predict_batch_onnx(onnx_session, images, num_classes, threshold)
 
@@ -483,7 +499,11 @@ def main() -> None:
             sample_index += 1
 
         # 更新进度条
-        if per_image_metrics:
+        if pytorch_model is not None and batch_count > 0:
+            avg_loss = total_loss_sum / batch_count
+            avg_iou = total_iou_sum / batch_count
+            iterator.set_postfix(loss=f"{avg_loss:.4f}", IoU=f"{avg_iou:.4f}")
+        elif per_image_metrics:
             last_metrics = per_image_metrics[-1][1]
             display_iou = last_metrics.get("IoU", last_metrics.get("mIoU", 0.0))
             iterator.set_postfix(IoU=f"{display_iou:.4f}")
@@ -497,6 +517,15 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"Evaluation Summary ({evaluated_count} images, {elapsed:.1f}s)")
     print(f"{'=' * 60}")
+
+    # 输出 val_loss 和 val_iou（与训练日志格式一致）
+    if pytorch_model is not None and batch_count > 0:
+        val_loss = total_loss_sum / batch_count
+        val_iou = total_iou_sum / batch_count
+        print(f"val_loss={val_loss:.4f}  val_iou={val_iou:.4f}")
+    else:
+        val_loss = float("nan")
+        val_iou = float("nan")
 
     summary: dict[str, dict[str, float]] = {}
 
@@ -536,7 +565,7 @@ def main() -> None:
 
     # 保存 JSON 汇总
     if output_dir is not None:
-        eval_summary = {
+        eval_summary: dict[str, Any] = {
             "evaluated_count": evaluated_count,
             "elapsed_seconds": elapsed,
             "image_size": list(image_size),
@@ -544,6 +573,8 @@ def main() -> None:
             "threshold": threshold,
             "pad": pad,
             "pad_align": pad_align,
+            "val_loss": val_loss,
+            "val_iou": val_iou,
             "summary": {k: {mk: float(mv) for mk, mv in v.items()} for k, v in summary.items()},
         }
         if args.checkpoint:
