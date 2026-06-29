@@ -146,11 +146,11 @@ def parse_args() -> argparse.Namespace:
                         help="推理设备，auto/cpu/cuda（默认 auto）")
     parser.add_argument("--amp", action="store_true",
                         help="启用混合精度推理")
-    parser.add_argument("--pad", action="store_true", default=None,
-                        help="使用填充模式（PyTorch 从 checkpoint 自动读取，ONNX 需手动指定）")
-    parser.add_argument("--pad-align", type=str, default=None,
+    parser.add_argument("--pad", action="store_true", default=False,
+                        help="使用填充模式（默认不开启）")
+    parser.add_argument("--pad-align", type=str, default="center",
                         choices=["center", "top_left"],
-                        help="填充对齐方式（PyTorch 从 checkpoint 自动读取）")
+                        help="填充对齐方式（默认 center）")
     parser.add_argument("--dynamic", action="store_true",
                         help="动态推理：保持原图尺寸，仅填充到 stride 的倍数后推理（逐张处理，无 batch）")
     parser.add_argument("--stride", type=int, default=32,
@@ -187,12 +187,12 @@ def main() -> None:
 
     if args.checkpoint:
         pytorch_model, checkpoint = load_pytorch_model(args.checkpoint, device)
-        image_size = tuple(checkpoint["image_size"])
+        image_size = tuple(args.imgsz) if args.imgsz is not None else tuple(checkpoint["image_size"])
         threshold = float(checkpoint.get("threshold", 0.5)) if args.threshold < 0 else args.threshold
         num_classes = int(checkpoint["model_config"]["num_classes"])
         preprocessing = checkpoint["preprocessing"]
-        pad = bool(checkpoint.get("pad", False)) if args.pad is None else args.pad
-        pad_align = str(checkpoint.get("pad_align", "center") or "center") if args.pad_align is None else args.pad_align
+        pad = bool(args.pad)
+        pad_align = args.pad_align
         mask_values_raw = checkpoint.get("mask_values")
         mask_values = [int(x) for x in list(mask_values_raw or [])] if mask_values_raw else []
         print(f"Loaded PyTorch checkpoint: {args.checkpoint}")
@@ -215,8 +215,8 @@ def main() -> None:
         threshold = 0.5 if args.threshold < 0 else args.threshold
         encoder_weights = resolve_encoder_weights(args.encoder_name, args.encoder_weights)
         preprocessing = get_preprocessing_config(args.encoder_name, encoder_weights)
-        pad = args.pad if args.pad is not None else False
-        pad_align = args.pad_align if args.pad_align is not None else "center"
+        pad = bool(args.pad)
+        pad_align = args.pad_align
         mask_values = []
         print(f"Loaded ONNX model: {args.onnx}")
         print(f"  image_size={list(image_size) if image_size else 'dynamic'} num_classes={num_classes} threshold={threshold:.4f}")
