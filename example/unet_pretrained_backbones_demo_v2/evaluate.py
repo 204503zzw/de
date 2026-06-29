@@ -287,32 +287,45 @@ def main() -> None:
             gt_padded = np.zeros((padded_image.size[1], padded_image.size[0]), dtype=np.uint8)
             gt_padded[:orig_h, :orig_w] = gt_array
 
+            # 构造 GT tensor
+            if num_classes == 1:
+                gt_tensor = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            else:
+                if mask_values:
+                    indexed = np.zeros(gt_padded.shape, dtype=np.int64)
+                    for ci, mv in enumerate(mask_values):
+                        indexed[gt_padded == mv] = ci
+                    gt_tensor = torch.from_numpy(indexed).unsqueeze(0).long()
+                else:
+                    gt_tensor = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long()
+
             # 推理 + 计算 loss/IoU
             if pytorch_model is not None:
                 input_device = input_tensor.to(device, non_blocking=True)
-                if num_classes == 1:
-                    gt_tensor = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
-                else:
-                    if mask_values:
-                        indexed = np.zeros(gt_padded.shape, dtype=np.int64)
-                        for ci, mv in enumerate(mask_values):
-                            indexed[gt_padded == mv] = ci
-                        gt_tensor = torch.from_numpy(indexed).unsqueeze(0).long().to(device)
-                    else:
-                        gt_tensor = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long().to(device)
+                gt_device = gt_tensor.to(device, non_blocking=True)
 
                 with torch.inference_mode():
                     autocast_enabled = use_amp and device.type == "cuda"
                     with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                         logits = pytorch_model(input_device)
-                        batch_loss = float(loss_fn(logits, gt_tensor).item())
-                batch_iou = compute_batch_iou(logits.detach(), gt_tensor.detach(), num_classes, threshold)
+                        batch_loss = float(loss_fn(logits, gt_device).item())
+                batch_iou = compute_batch_iou(logits.detach(), gt_device.detach(), num_classes, threshold)
                 total_loss_sum += batch_loss
                 total_iou_sum += batch_iou
                 batch_count += 1
 
                 print(f"[{idx + 1}/{sample_count}] {stem}  "
                       f"loss={batch_loss:.4f}  iou={batch_iou:.4f}")
+            else:
+                input_name = onnx_session.get_inputs()[0].name
+                outputs = onnx_session.run(None, {input_name: input_tensor.numpy()})
+                logits_np = outputs[0]
+                logits_tensor = torch.from_numpy(logits_np)
+                batch_iou = compute_batch_iou(logits_tensor, gt_tensor, num_classes, threshold)
+                total_iou_sum += batch_iou
+                batch_count += 1
+
+                print(f"[{idx + 1}/{sample_count}] {stem}  iou={batch_iou:.4f}")
 
     else:
         # ==============================================================
@@ -371,6 +384,15 @@ def main() -> None:
                 total_iou_sum += batch_iou
                 batch_count += 1
                 iterator.set_postfix(loss=f"{batch_loss:.4f}", IoU=f"{batch_iou:.4f}")
+            else:
+                input_name = onnx_session.get_inputs()[0].name
+                input_array = images.numpy().astype(np.float32)
+                outputs = onnx_session.run(None, {input_name: input_array})
+                logits_tensor = torch.from_numpy(outputs[0])
+                batch_iou = compute_batch_iou(logits_tensor, masks, num_classes, threshold)
+                total_iou_sum += batch_iou
+                batch_count += 1
+                iterator.set_postfix(IoU=f"{batch_iou:.4f}")
 
     elapsed = time.time() - started_at
 
@@ -381,14 +403,16 @@ def main() -> None:
     print(f"Evaluation Summary ({sample_count} images, {elapsed:.1f}s)")
     print(f"{'=' * 60}")
 
-    if batch_count > 0:
+    val_iou = total_iou_sum / batch_count if batch_count > 0 else float("nan")
+    if pytorch_model is not None and batch_count > 0:
         val_loss = total_loss_sum / batch_count
-        val_iou = total_iou_sum / batch_count
         print(f"val_loss={val_loss:.4f}  val_iou={val_iou:.4f}")
+    elif batch_count > 0:
+        val_loss = float("nan")
+        print(f"val_iou={val_iou:.4f}  (ONNX mode, no loss)")
     else:
         val_loss = float("nan")
-        val_iou = float("nan")
-        print("No batches evaluated (ONNX mode does not compute loss/IoU)")
+        print("No batches evaluated")
 
     print(f"{'=' * 60}")
 
