@@ -846,6 +846,32 @@ def compute_batch_iou(
 
 
 @torch.no_grad()
+def compute_mask_iou(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    num_classes: int,
+    threshold: int = 127,
+) -> tuple[float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """使用 smp.metrics 计算 IoU（与训练验证一致）。
+
+    返回 (iou, tp, fp, fn, tn)，其中 tp/fp/fn/tn 为 smp.metrics.get_stats
+    的原始输出，可累加后重新计算 Global IoU。
+    """
+    if num_classes == 1:
+        predictions = torch.from_numpy((pred > threshold).astype(np.int64)).unsqueeze(0)
+        target_labels = torch.from_numpy((gt > threshold).astype(np.int64)).unsqueeze(0)
+        tp, fp, fn, tn = smp.metrics.get_stats(predictions, target_labels, mode="binary")
+    else:
+        predictions = torch.from_numpy(pred.astype(np.int64)).unsqueeze(0)
+        target_labels = torch.from_numpy(gt.astype(np.int64)).unsqueeze(0)
+        tp, fp, fn, tn = smp.metrics.get_stats(
+            predictions, target_labels, mode="multiclass", num_classes=num_classes,
+        )
+    iou = float(smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro").item())
+    return iou, tp, fp, fn, tn
+
+
+@torch.no_grad()
 def predict_mask_from_logits(
     logits: torch.Tensor,
     num_classes: int,
