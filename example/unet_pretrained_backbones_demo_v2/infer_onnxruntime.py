@@ -3,7 +3,11 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import segmentation_models_pytorch as smp
+import torch
 from PIL import Image, ImageDraw, ImageFont
+
+from common import compute_mask_iou
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
@@ -558,6 +562,10 @@ def main() -> None:
     global_fp = 0.0
     global_fn = 0.0
     global_tn = 0.0
+    smp_global_tp: torch.Tensor | None = None
+    smp_global_fp: torch.Tensor | None = None
+    smp_global_fn: torch.Tensor | None = None
+    smp_global_tn: torch.Tensor | None = None
     per_image_metrics: list[tuple[str, dict[str, float]]] = []
     evaluated_count = 0
 
@@ -608,6 +616,23 @@ def main() -> None:
                     global_tn += current_metrics["TN"]
                 else:
                     current_metrics = compute_multiclass_metrics(mask, gt_mask, int(runtime_num_classes))
+                iou_val, s_tp, s_fp, s_fn, s_tn = compute_mask_iou(
+                    mask, gt_mask, int(runtime_num_classes),
+                )
+                if int(runtime_num_classes) == 1:
+                    current_metrics["IoU"] = iou_val
+                else:
+                    current_metrics["mIoU"] = iou_val
+                if smp_global_tp is None:
+                    smp_global_tp = s_tp
+                    smp_global_fp = s_fp
+                    smp_global_fn = s_fn
+                    smp_global_tn = s_tn
+                else:
+                    smp_global_tp = smp_global_tp + s_tp
+                    smp_global_fp = smp_global_fp + s_fp
+                    smp_global_fn = smp_global_fn + s_fn
+                    smp_global_tn = smp_global_tn + s_tn
                 per_image_metrics.append((stem, current_metrics))
                 evaluated_count += 1
                 print_metrics(current_metrics, prefix=f"[{stem}] ")
@@ -641,13 +666,26 @@ def main() -> None:
         num_classes_final = int(runtime_num_classes) if 'runtime_num_classes' in dir() else 1
         if num_classes_final == 1:
             total = global_tp + global_fp + global_fn + global_tn
+            global_iou = float(smp.metrics.iou_score(
+                smp_global_tp, smp_global_fp, smp_global_fn, smp_global_tn,
+                reduction="micro",
+            ).item()) if smp_global_tp is not None else float("nan")
             global_results = {
-                "IoU": global_tp / (global_tp + global_fp + global_fn) if (global_tp + global_fp + global_fn) > 0 else float("nan"),
+                "IoU": global_iou,
                 "Dice": 2 * global_tp / (2 * global_tp + global_fp + global_fn) if (2 * global_tp + global_fp + global_fn) > 0 else float("nan"),
                 "Precision": global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else float("nan"),
                 "Recall": global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else float("nan"),
                 "Accuracy": (global_tp + global_tn) / total if total > 0 else float("nan"),
             }
+            summary["Global"] = global_results
+            print("[Global (pixel-level)]")
+            print_metrics(global_results, prefix="  ")
+        elif smp_global_tp is not None:
+            global_iou = float(smp.metrics.iou_score(
+                smp_global_tp, smp_global_fp, smp_global_fn, smp_global_tn,
+                reduction="micro",
+            ).item())
+            global_results = {"mIoU": global_iou}
             summary["Global"] = global_results
             print("[Global (pixel-level)]")
             print_metrics(global_results, prefix="  ")
