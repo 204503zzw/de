@@ -859,7 +859,7 @@ def compute_mask_iou(
     """
     if num_classes == 1:
         predictions = torch.from_numpy((pred > threshold).astype(np.int64)).unsqueeze(0)
-        target_labels = torch.from_numpy((gt > threshold).astype(np.int64)).unsqueeze(0)
+        target_labels = torch.from_numpy((gt > 0).astype(np.int64)).unsqueeze(0)
         tp, fp, fn, tn = smp.metrics.get_stats(predictions, target_labels, mode="binary")
     else:
         predictions = torch.from_numpy(pred.astype(np.int64)).unsqueeze(0)
