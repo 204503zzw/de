@@ -166,10 +166,10 @@ def main() -> None:
     global_fp = 0.0
     global_fn = 0.0
     global_tn = 0.0
-    smp_global_tp: torch.Tensor | None = None
-    smp_global_fp: torch.Tensor | None = None
-    smp_global_fn: torch.Tensor | None = None
-    smp_global_tn: torch.Tensor | None = None
+    smp_global_tp = 0.0
+    smp_global_fp = 0.0
+    smp_global_fn = 0.0
+    smp_global_tn = 0.0
     per_image_metrics: list[tuple[str, dict[str, float]]] = []
     evaluated_count = 0
 
@@ -245,16 +245,10 @@ def main() -> None:
                     current_metrics["IoU"] = iou_val
                 else:
                     current_metrics["mIoU"] = iou_val
-                if smp_global_tp is None:
-                    smp_global_tp = s_tp
-                    smp_global_fp = s_fp
-                    smp_global_fn = s_fn
-                    smp_global_tn = s_tn
-                else:
-                    smp_global_tp = smp_global_tp + s_tp
-                    smp_global_fp = smp_global_fp + s_fp
-                    smp_global_fn = smp_global_fn + s_fn
-                    smp_global_tn = smp_global_tn + s_tn
+                smp_global_tp += float(s_tp.sum().item())
+                smp_global_fp += float(s_fp.sum().item())
+                smp_global_fn += float(s_fn.sum().item())
+                smp_global_tn += float(s_tn.sum().item())
                 per_image_metrics.append((stem, current_metrics))
                 evaluated_count += 1
                 print_metrics(current_metrics, prefix=f"[{stem}] ")
@@ -287,10 +281,8 @@ def main() -> None:
         summary: dict[str, dict[str, float]] = {}
         if num_classes == 1:
             total = global_tp + global_fp + global_fn + global_tn
-            global_iou = float(smp.metrics.iou_score(
-                smp_global_tp, smp_global_fp, smp_global_fn, smp_global_tn,
-                reduction="micro",
-            ).item()) if smp_global_tp is not None else float("nan")
+            smp_denom = smp_global_tp + smp_global_fp + smp_global_fn
+            global_iou = smp_global_tp / smp_denom if smp_denom > 0 else float("nan")
             global_results = {
                 "IoU": global_iou,
                 "Dice": 2 * global_tp / (2 * global_tp + global_fp + global_fn) if (2 * global_tp + global_fp + global_fn) > 0 else float("nan"),
@@ -301,11 +293,9 @@ def main() -> None:
             summary["Global"] = global_results
             print("[Global (pixel-level)]")
             print_metrics(global_results, prefix="  ")
-        elif smp_global_tp is not None:
-            global_iou = float(smp.metrics.iou_score(
-                smp_global_tp, smp_global_fp, smp_global_fn, smp_global_tn,
-                reduction="micro",
-            ).item())
+        else:
+            smp_denom = smp_global_tp + smp_global_fp + smp_global_fn
+            global_iou = smp_global_tp / smp_denom if smp_denom > 0 else float("nan")
             global_results = {"mIoU": global_iou}
             summary["Global"] = global_results
             print("[Global (pixel-level)]")
