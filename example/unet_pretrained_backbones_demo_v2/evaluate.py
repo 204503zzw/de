@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import segmentation_models_pytorch as smp
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -249,6 +250,9 @@ def main() -> None:
 
     total_loss_sum = 0.0
     total_iou_sum = 0.0
+    global_tp = 0.0
+    global_fp = 0.0
+    global_fn = 0.0
     batch_count = 0
     sample_count = 0
     started_at = time.time()
@@ -309,10 +313,27 @@ def main() -> None:
                     with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                         logits = pytorch_model(input_device)
                         batch_loss = float(loss_fn(logits, gt_device).item())
-                batch_iou = compute_batch_iou(logits.detach(), gt_device.detach(), num_classes, threshold)
+                logits_det = logits.detach()
+                gt_det = gt_device.detach()
+                batch_iou = compute_batch_iou(logits_det, gt_det, num_classes, threshold)
                 total_loss_sum += batch_loss
                 total_iou_sum += batch_iou
                 batch_count += 1
+
+                # 累加 Global 统计量
+                with torch.inference_mode():
+                    if num_classes == 1:
+                        preds = (torch.sigmoid(logits_det).squeeze(1) > threshold).long()
+                        targets = gt_det.squeeze(1).long()
+                        tp, fp, fn, _ = smp.metrics.get_stats(preds, targets, mode="binary")
+                    else:
+                        preds = torch.argmax(logits_det, dim=1)
+                        tp, fp, fn, _ = smp.metrics.get_stats(
+                            preds, gt_det.long(), mode="multiclass", num_classes=num_classes,
+                        )
+                    global_tp += float(tp.sum().item())
+                    global_fp += float(fp.sum().item())
+                    global_fn += float(fn.sum().item())
 
                 print(f"[{idx + 1}/{sample_count}] {stem}  "
                       f"loss={batch_loss:.4f}  iou={batch_iou:.4f}")
@@ -324,6 +345,20 @@ def main() -> None:
                 batch_iou = compute_batch_iou(logits_tensor, gt_tensor, num_classes, threshold)
                 total_iou_sum += batch_iou
                 batch_count += 1
+
+                # 累加 Global 统计量
+                if num_classes == 1:
+                    preds = (torch.sigmoid(logits_tensor).squeeze(1) > threshold).long()
+                    targets = gt_tensor.squeeze(1).long()
+                    tp, fp, fn, _ = smp.metrics.get_stats(preds, targets, mode="binary")
+                else:
+                    preds = torch.argmax(logits_tensor, dim=1)
+                    tp, fp, fn, _ = smp.metrics.get_stats(
+                        preds, gt_tensor.long(), mode="multiclass", num_classes=num_classes,
+                    )
+                global_tp += float(tp.sum().item())
+                global_fp += float(fp.sum().item())
+                global_fn += float(fn.sum().item())
 
                 print(f"[{idx + 1}/{sample_count}] {stem}  iou={batch_iou:.4f}")
 
@@ -404,12 +439,23 @@ def main() -> None:
     print(f"{'=' * 60}")
 
     val_iou = total_iou_sum / batch_count if batch_count > 0 else float("nan")
+    global_denom = global_tp + global_fp + global_fn
+    val_iou_global = global_tp / global_denom if global_denom > 0 else float("nan")
     if pytorch_model is not None and batch_count > 0:
         val_loss = total_loss_sum / batch_count
-        print(f"val_loss={val_loss:.4f}  val_iou={val_iou:.4f}")
+        if dynamic:
+            print(f"val_loss={val_loss:.4f}")
+            print(f"val_iou (Mean)={val_iou:.4f}")
+            print(f"val_iou (Global)={val_iou_global:.4f}")
+        else:
+            print(f"val_loss={val_loss:.4f}  val_iou={val_iou:.4f}")
     elif batch_count > 0:
         val_loss = float("nan")
-        print(f"val_iou={val_iou:.4f}  (ONNX mode, no loss)")
+        if dynamic:
+            print(f"val_iou (Mean)={val_iou:.4f}  (ONNX mode, no loss)")
+            print(f"val_iou (Global)={val_iou_global:.4f}")
+        else:
+            print(f"val_iou={val_iou:.4f}  (ONNX mode, no loss)")
     else:
         val_loss = float("nan")
         print("No batches evaluated")
@@ -428,6 +474,7 @@ def main() -> None:
             "val_iou": val_iou,
         }
         if dynamic:
+            eval_summary["val_iou_global"] = val_iou_global
             eval_summary["stride"] = stride
         else:
             eval_summary["image_size"] = list(image_size)
