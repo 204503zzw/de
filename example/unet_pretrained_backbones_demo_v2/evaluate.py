@@ -287,49 +287,55 @@ def main() -> None:
             img_array = preprocess_image_array(img_array, preprocessing)
             input_tensor = torch.from_numpy(np.transpose(img_array, (2, 0, 1))).float().unsqueeze(0)
 
-            # GT tensor（填充到与输入相同尺寸）
+            # GT tensor — 填充版（用于 loss）和原图版（用于 IoU）
             gt_padded = np.zeros((padded_image.size[1], padded_image.size[0]), dtype=np.uint8)
             gt_padded[:orig_h, :orig_w] = gt_array
 
-            # 构造 GT tensor
             if num_classes == 1:
-                gt_tensor = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+                gt_tensor_padded = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+                gt_tensor_orig = torch.from_numpy((gt_array > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
             else:
                 if mask_values:
-                    indexed = np.zeros(gt_padded.shape, dtype=np.int64)
+                    indexed_padded = np.zeros(gt_padded.shape, dtype=np.int64)
+                    indexed_orig = np.zeros(gt_array.shape, dtype=np.int64)
                     for ci, mv in enumerate(mask_values):
-                        indexed[gt_padded == mv] = ci
-                    gt_tensor = torch.from_numpy(indexed).unsqueeze(0).long()
+                        indexed_padded[gt_padded == mv] = ci
+                        indexed_orig[gt_array == mv] = ci
+                    gt_tensor_padded = torch.from_numpy(indexed_padded).unsqueeze(0).long()
+                    gt_tensor_orig = torch.from_numpy(indexed_orig).unsqueeze(0).long()
                 else:
-                    gt_tensor = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long()
+                    gt_tensor_padded = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long()
+                    gt_tensor_orig = torch.from_numpy(gt_array.astype(np.int64)).unsqueeze(0).long()
 
-            # 推理 + 计算 loss/IoU
+            # 推理 + 计算 loss（填充尺寸）+ IoU（原图尺寸）
             if pytorch_model is not None:
                 input_device = input_tensor.to(device, non_blocking=True)
-                gt_device = gt_tensor.to(device, non_blocking=True)
+                gt_padded_device = gt_tensor_padded.to(device, non_blocking=True)
 
                 with torch.inference_mode():
                     autocast_enabled = use_amp and device.type == "cuda"
                     with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                         logits = pytorch_model(input_device)
-                        batch_loss = float(loss_fn(logits, gt_device).item())
-                logits_det = logits.detach()
-                gt_det = gt_device.detach()
-                batch_iou = compute_batch_iou(logits_det, gt_det, num_classes, threshold)
+                        batch_loss = float(loss_fn(logits, gt_padded_device).item())
+
+                # 裁回原图尺寸计算 IoU
+                logits_cropped = logits.detach()[:, :, :orig_h, :orig_w]
+                gt_orig_device = gt_tensor_orig.to(device, non_blocking=True)
+                batch_iou = compute_batch_iou(logits_cropped, gt_orig_device, num_classes, threshold)
                 total_loss_sum += batch_loss
                 total_iou_sum += batch_iou
                 batch_count += 1
 
-                # 累加 Global 统计量
+                # 累加 Global 统计量（原图尺寸）
                 with torch.inference_mode():
                     if num_classes == 1:
-                        preds = (torch.sigmoid(logits_det).squeeze(1) > threshold).long()
-                        targets = gt_det.squeeze(1).long()
+                        preds = (torch.sigmoid(logits_cropped).squeeze(1) > threshold).long()
+                        targets = gt_orig_device.squeeze(1).long()
                         tp, fp, fn, _ = smp.metrics.get_stats(preds, targets, mode="binary")
                     else:
-                        preds = torch.argmax(logits_det, dim=1)
+                        preds = torch.argmax(logits_cropped, dim=1)
                         tp, fp, fn, _ = smp.metrics.get_stats(
-                            preds, gt_det.long(), mode="multiclass", num_classes=num_classes,
+                            preds, gt_orig_device.long(), mode="multiclass", num_classes=num_classes,
                         )
                     global_tp += float(tp.sum().item())
                     global_fp += float(fp.sum().item())
@@ -342,19 +348,22 @@ def main() -> None:
                 outputs = onnx_session.run(None, {input_name: input_tensor.numpy()})
                 logits_np = outputs[0]
                 logits_tensor = torch.from_numpy(logits_np)
-                batch_iou = compute_batch_iou(logits_tensor, gt_tensor, num_classes, threshold)
+
+                # 裁回原图尺寸计算 IoU
+                logits_cropped = logits_tensor[:, :, :orig_h, :orig_w]
+                batch_iou = compute_batch_iou(logits_cropped, gt_tensor_orig, num_classes, threshold)
                 total_iou_sum += batch_iou
                 batch_count += 1
 
-                # 累加 Global 统计量
+                # 累加 Global 统计量（原图尺寸）
                 if num_classes == 1:
-                    preds = (torch.sigmoid(logits_tensor).squeeze(1) > threshold).long()
-                    targets = gt_tensor.squeeze(1).long()
+                    preds = (torch.sigmoid(logits_cropped).squeeze(1) > threshold).long()
+                    targets = gt_tensor_orig.squeeze(1).long()
                     tp, fp, fn, _ = smp.metrics.get_stats(preds, targets, mode="binary")
                 else:
-                    preds = torch.argmax(logits_tensor, dim=1)
+                    preds = torch.argmax(logits_cropped, dim=1)
                     tp, fp, fn, _ = smp.metrics.get_stats(
-                        preds, gt_tensor.long(), mode="multiclass", num_classes=num_classes,
+                        preds, gt_tensor_orig.long(), mode="multiclass", num_classes=num_classes,
                     )
                 global_tp += float(tp.sum().item())
                 global_fp += float(fp.sum().item())
