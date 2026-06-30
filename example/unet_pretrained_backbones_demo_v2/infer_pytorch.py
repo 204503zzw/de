@@ -36,7 +36,7 @@ def load_gt_mask(gt_dir: Path, stem: str) -> np.ndarray | None:
 
 def compute_binary_metrics(pred: np.ndarray, gt: np.ndarray) -> dict[str, float]:
     p = pred > 127
-    g = gt > 127
+    g = gt > 0
     tp = float(np.sum(p & g))
     fp = float(np.sum(p & ~g))
     fn = float(np.sum(~p & g))
