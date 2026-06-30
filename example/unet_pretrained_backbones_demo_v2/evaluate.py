@@ -287,40 +287,31 @@ def main() -> None:
             img_array = preprocess_image_array(img_array, preprocessing)
             input_tensor = torch.from_numpy(np.transpose(img_array, (2, 0, 1))).float().unsqueeze(0)
 
-            # GT tensor — 填充版（用于 loss）和原图版（用于 IoU）
-            gt_padded = np.zeros((padded_image.size[1], padded_image.size[0]), dtype=np.uint8)
-            gt_padded[:orig_h, :orig_w] = gt_array
-
+            # 构造原图尺寸的 GT tensor（裁掉填充后计算 loss 和 IoU）
             if num_classes == 1:
-                gt_tensor_padded = torch.from_numpy((gt_padded > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
                 gt_tensor_orig = torch.from_numpy((gt_array > 0).astype(np.float32)).unsqueeze(0).unsqueeze(0)
             else:
                 if mask_values:
-                    indexed_padded = np.zeros(gt_padded.shape, dtype=np.int64)
                     indexed_orig = np.zeros(gt_array.shape, dtype=np.int64)
                     for ci, mv in enumerate(mask_values):
-                        indexed_padded[gt_padded == mv] = ci
                         indexed_orig[gt_array == mv] = ci
-                    gt_tensor_padded = torch.from_numpy(indexed_padded).unsqueeze(0).long()
                     gt_tensor_orig = torch.from_numpy(indexed_orig).unsqueeze(0).long()
                 else:
-                    gt_tensor_padded = torch.from_numpy(gt_padded.astype(np.int64)).unsqueeze(0).long()
                     gt_tensor_orig = torch.from_numpy(gt_array.astype(np.int64)).unsqueeze(0).long()
 
-            # 推理 + 计算 loss（填充尺寸）+ IoU（原图尺寸）
+            # 推理 + 计算 loss 和 IoU（均在原图尺寸上）
             if pytorch_model is not None:
                 input_device = input_tensor.to(device, non_blocking=True)
-                gt_padded_device = gt_tensor_padded.to(device, non_blocking=True)
 
                 with torch.inference_mode():
                     autocast_enabled = use_amp and device.type == "cuda"
                     with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                         logits = pytorch_model(input_device)
-                        batch_loss = float(loss_fn(logits, gt_padded_device).item())
 
-                # 裁回原图尺寸计算 IoU
+                # 裁回原图尺寸计算 loss 和 IoU
                 logits_cropped = logits.detach()[:, :, :orig_h, :orig_w]
                 gt_orig_device = gt_tensor_orig.to(device, non_blocking=True)
+                batch_loss = float(loss_fn(logits_cropped, gt_orig_device).item())
                 batch_iou = compute_batch_iou(logits_cropped, gt_orig_device, num_classes, threshold)
                 total_loss_sum += batch_loss
                 total_iou_sum += batch_iou
