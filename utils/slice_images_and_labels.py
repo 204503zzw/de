@@ -327,10 +327,10 @@ def process_one_image(
             skipped += 1
             continue
 
-        # 保存切片图片
+        # 保存切片图片（统一输出 PNG 格式）
         tile_img = img.crop((x0, y0, x1, y1))
-        tile_img_path = output_images_dir / f"{tile_name}{suffix}"
-        tile_img.save(tile_img_path)
+        tile_img_path = output_images_dir / f"{tile_name}.png"
+        tile_img.save(tile_img_path, format="PNG")
 
         # 保存切片标注
         if label_data is not None:
@@ -342,7 +342,7 @@ def process_one_image(
                 new_label["imageHeight"] = y1 - y0
                 new_label.pop("imageData", None)
 
-            new_label["imagePath"] = f"{tile_name}{suffix}"
+            new_label["imagePath"] = f"{tile_name}.png"
             if embed_image_data:
                 new_label["imageData"] = encode_image_data(tile_img)
 
