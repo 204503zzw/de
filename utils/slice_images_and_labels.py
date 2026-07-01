@@ -173,11 +173,11 @@ def generate_tile_coords(
     y_starts = sorted(set(y_starts))
     x_starts = sorted(set(x_starts))
 
-    for y0 in y_starts:
-        for x0 in x_starts:
+    for row, y0 in enumerate(y_starts):
+        for col, x0 in enumerate(x_starts):
             x1 = min(x0 + tile_w, img_width)
             y1 = min(y0 + tile_h, img_height)
-            tiles.append((x0, y0, x1, y1))
+            tiles.append((x0, y0, x1, y1, row, col))
     return tiles
 
 
@@ -316,8 +316,8 @@ def process_one_image(
     created = 0
     skipped = 0
 
-    for idx, (x0, y0, x1, y1) in enumerate(tiles):
-        tile_name = f"{stem}_{idx:04d}"
+    for x0, y0, x1, y1, row, col in tiles:
+        tile_name = f"{stem}_r{row}_c{col}"
 
         new_label = None
         if label_data is not None:
