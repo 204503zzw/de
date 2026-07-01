@@ -276,8 +276,8 @@ def slice_label(
     new_label["shapes"] = new_shapes
     new_label["imageWidth"] = tile_w
     new_label["imageHeight"] = tile_h
-    # 清除原图 imageData（切片后需要重新编码或不内嵌）
-    new_label.pop("imageData", None)
+    # 置空原图 imageData（保留字段，X-AnyLabeling 等工具需要该字段存在）
+    new_label["imageData"] = None
     return new_label
 
 
@@ -340,7 +340,7 @@ def process_one_image(
                 new_label["shapes"] = []
                 new_label["imageWidth"] = x1 - x0
                 new_label["imageHeight"] = y1 - y0
-                new_label.pop("imageData", None)
+                new_label["imageData"] = None
 
             new_label["imagePath"] = f"{tile_name}.png"
             if embed_image_data:
