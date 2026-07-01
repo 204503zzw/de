@@ -140,7 +140,11 @@ def generate_tile_coords(
 ) -> list[tuple[int, int, int, int]]:
     """生成切片坐标列表 [(x0, y0, x1, y1), ...]，覆盖整张图片。
 
-    最后一列/行的切片会向前偏移以保证切片尺寸一致（不出现小于 tile 的碎片）。
+    边界策略：
+    - 当原图尺寸 >= 切片尺寸时，最后一列/行的切片向前回退，保证每个切片都是
+      完整的 tile_w × tile_h（回退部分与前一个切片重叠）。
+    - 当原图某一边 < 切片尺寸时，不回退、不填充，直接保留原图该边的实际尺寸，
+      生成一个宽/高小于 tile 的切片。
     """
     stride_x = tile_w - overlap
     stride_y = tile_h - overlap
@@ -151,10 +155,13 @@ def generate_tile_coords(
         )
 
     tiles = []
+
+    # 原图 >= 切片尺寸：正常滑窗；原图 < 切片尺寸：仅从 0 开始，保留原尺寸
     y_starts = list(range(0, max(img_height - tile_h, 0) + 1, stride_y))
     x_starts = list(range(0, max(img_width - tile_w, 0) + 1, stride_x))
 
-    # 确保最后一个切片覆盖到图片边界
+    # 确保最后一个切片覆盖到图片边界（回退到 img_dim - tile_dim 的位置）
+    # 当 img_dim < tile_dim 时 max(..., 0) == 0，不会回退，保留原尺寸
     if not y_starts or y_starts[-1] + tile_h < img_height:
         y_starts.append(max(img_height - tile_h, 0))
     if not x_starts or x_starts[-1] + tile_w < img_width:
