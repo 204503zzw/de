@@ -5,25 +5,25 @@
 
 用法示例::
 
-    # 基本用法：640×640 切片，重叠 128 像素
+    # 基本用法：640×640 切片，20% 重叠率
     python -m utils.slice_images_and_labels \
         --images  data/images \
         --labels  data/labels \
         --output  data/sliced \
         --slice-width  640 \
         --slice-height 640 \
-        --overlap 128
+        --overlap-ratio 0.2
 
     # 只保留含标注的切片
     python -m utils.slice_images_and_labels \
         --images data/images --labels data/labels --output data/sliced \
-        --slice-width 640 --slice-height 640 --overlap 128 \
+        --slice-width 640 --slice-height 640 --overlap-ratio 0.2 \
         --skip-empty
 
     # 丢弃面积占比 < 10% 的碎片标注
     python -m utils.slice_images_and_labels \
         --images data/images --labels data/labels --output data/sliced \
-        --slice-width 640 --slice-height 640 --overlap 128 \
+        --slice-width 640 --slice-height 640 --overlap-ratio 0.2 \
         --min-area-ratio 0.1
 """
 
@@ -136,9 +136,12 @@ def generate_tile_coords(
     img_height: int,
     tile_w: int,
     tile_h: int,
-    overlap: int,
+    overlap_ratio: float = 0.0,
 ) -> list[tuple[int, int, int, int]]:
     """生成切片坐标列表 [(x0, y0, x1, y1), ...]，覆盖整张图片。
+
+    Args:
+        overlap_ratio: 相邻切片重叠率，范围 [0, 1)，例如 0.2 表示 20% 重叠。
 
     边界策略：
     - 当原图尺寸 >= 切片尺寸时，最后一列/行的切片向前回退，保证每个切片都是
@@ -146,13 +149,12 @@ def generate_tile_coords(
     - 当原图某一边 < 切片尺寸时，不回退、不填充，直接保留原图该边的实际尺寸，
       生成一个宽/高小于 tile 的切片。
     """
-    stride_x = tile_w - overlap
-    stride_y = tile_h - overlap
-    if stride_x <= 0 or stride_y <= 0:
+    if not (0.0 <= overlap_ratio < 1.0):
         raise ValueError(
-            f"overlap ({overlap}) must be smaller than tile size "
-            f"({tile_w}x{tile_h})"
+            f"overlap_ratio ({overlap_ratio}) must be in [0, 1)"
         )
+    stride_x = max(1, int(tile_w * (1.0 - overlap_ratio)))
+    stride_y = max(1, int(tile_h * (1.0 - overlap_ratio)))
 
     tiles = []
 
@@ -293,7 +295,7 @@ def process_one_image(
     output_labels_dir: Path,
     tile_w: int,
     tile_h: int,
-    overlap: int,
+    overlap_ratio: float,
     min_area_ratio: float,
     skip_empty: bool,
     embed_image_data: bool,
@@ -307,7 +309,7 @@ def process_one_image(
         with open(label_path, "r", encoding="utf-8") as f:
             label_data = json.load(f)
 
-    tiles = generate_tile_coords(img_width, img_height, tile_w, tile_h, overlap)
+    tiles = generate_tile_coords(img_width, img_height, tile_w, tile_h, overlap_ratio)
     stem = image_path.stem
     suffix = image_path.suffix
 
@@ -340,7 +342,7 @@ def process_one_image(
                 new_label["imageHeight"] = y1 - y0
                 new_label.pop("imageData", None)
 
-            new_label["imagePath"] = f"../images/{tile_name}{suffix}"
+            new_label["imagePath"] = f"{tile_name}{suffix}"
             if embed_image_data:
                 new_label["imageData"] = encode_image_data(tile_img)
 
@@ -379,8 +381,8 @@ def main(argv: list[str] | None = None) -> None:
         help="切片高度（像素）",
     )
     parser.add_argument(
-        "--overlap", type=int, default=0,
-        help="相邻切片重叠像素数（默认 0）",
+        "--overlap-ratio", type=float, default=0.0,
+        help="相邻切片重叠率，范围 [0, 1)，例如 0.2 表示 20%% 重叠（默认 0，不重叠）",
     )
     parser.add_argument(
         "--min-area-ratio", type=float, default=0.0,
@@ -437,7 +439,7 @@ def main(argv: list[str] | None = None) -> None:
             output_labels_dir=output_labels_dir,
             tile_w=args.slice_width,
             tile_h=args.slice_height,
-            overlap=args.overlap,
+            overlap_ratio=args.overlap_ratio,
             min_area_ratio=args.min_area_ratio,
             skip_empty=args.skip_empty,
             embed_image_data=args.embed_image_data,
