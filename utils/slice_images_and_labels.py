@@ -164,10 +164,21 @@ def generate_tile_coords(
 
     # 确保最后一个切片覆盖到图片边界（回退到 img_dim - tile_dim 的位置）
     # 当 img_dim < tile_dim 时 max(..., 0) == 0，不会回退，保留原尺寸
+    # 当回退位置与上一个位置间距 < stride 时，替换上一个而非新增，避免近重复切片
+    # （仅当已有 ≥2 个位置时替换，保证首位置 0 不丢失）
+    y_boundary = max(img_height - tile_h, 0)
     if not y_starts or y_starts[-1] + tile_h < img_height:
-        y_starts.append(max(img_height - tile_h, 0))
+        if len(y_starts) >= 2 and y_boundary - y_starts[-1] < stride_y:
+            y_starts[-1] = y_boundary
+        else:
+            y_starts.append(y_boundary)
+
+    x_boundary = max(img_width - tile_w, 0)
     if not x_starts or x_starts[-1] + tile_w < img_width:
-        x_starts.append(max(img_width - tile_w, 0))
+        if len(x_starts) >= 2 and x_boundary - x_starts[-1] < stride_x:
+            x_starts[-1] = x_boundary
+        else:
+            x_starts.append(x_boundary)
 
     # 去重
     y_starts = sorted(set(y_starts))
