@@ -49,6 +49,37 @@ from common import (
 
 
 # ---------------------------------------------------------------------------
+# 逐图 IoU 计算
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_per_image_iou(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int,
+    threshold: float,
+) -> list[float]:
+    """返回 batch 中每张图像各自的 IoU（micro 方式合并类别）。"""
+    if num_classes == 1:
+        probabilities = torch.sigmoid(logits).squeeze(1)
+        predictions = (probabilities > threshold).long()
+        target_labels = targets.squeeze(1).long()
+        tp, fp, fn, _tn = smp.metrics.get_stats(predictions, target_labels, mode="binary")
+    else:
+        predictions = torch.argmax(logits, dim=1)
+        tp, fp, fn, _tn = smp.metrics.get_stats(
+            predictions, targets.long(), mode="multiclass", num_classes=num_classes,
+        )
+    # tp/fp/fn shape: (batch, num_classes) — sum across classes per image
+    tp_sum = tp.sum(dim=1).float()
+    fp_sum = fp.sum(dim=1).float()
+    fn_sum = fn.sum(dim=1).float()
+    denom = tp_sum + fp_sum + fn_sum
+    iou_per_image = torch.where(denom > 0, tp_sum / denom, torch.zeros_like(tp_sum))
+    return [float(v.item()) for v in iou_per_image]
+
+
+# ---------------------------------------------------------------------------
 # 动态推理辅助
 # ---------------------------------------------------------------------------
 
@@ -160,6 +191,8 @@ def parse_args() -> argparse.Namespace:
     # 输出
     parser.add_argument("--output-dir", type=str, default=None,
                         help="输出目录，保存 JSON 结果")
+    parser.add_argument("--low-iou-thresh", type=float, default=0.5,
+                        help="低 IoU 阈值，低于此值的图片将被记录到统计 TXT（默认 0.5）")
 
     return parser.parse_args()
 
@@ -248,6 +281,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     loss_fn = create_loss_function(num_classes) if pytorch_model is not None else None
 
+    low_iou_thresh = float(args.low_iou_thresh)
+
     total_loss_sum = 0.0
     total_iou_sum = 0.0
     global_tp = 0.0
@@ -255,6 +290,7 @@ def main() -> None:
     global_fn = 0.0
     batch_count = 0
     sample_count = 0
+    per_image_ious: list[tuple[str, float]] = []   # (image_name, iou)
     started_at = time.time()
 
     if dynamic:
@@ -332,6 +368,8 @@ def main() -> None:
                     global_fp += float(fp.sum().item())
                     global_fn += float(fn.sum().item())
 
+                per_image_ious.append((stem, batch_iou))
+
                 print(f"[{idx + 1}/{sample_count}] {stem}  "
                       f"loss={batch_loss:.4f}  iou={batch_iou:.4f}")
             else:
@@ -359,6 +397,8 @@ def main() -> None:
                 global_tp += float(tp.sum().item())
                 global_fp += float(fp.sum().item())
                 global_fn += float(fn.sum().item())
+
+                per_image_ious.append((stem, batch_iou))
 
                 print(f"[{idx + 1}/{sample_count}] {stem}  iou={batch_iou:.4f}")
 
@@ -404,7 +444,9 @@ def main() -> None:
 
         iterator = tqdm(val_loader, total=len(val_loader), leave=True, disable=not enable_live_progress)
 
+        sample_idx = 0
         for images, masks in iterator:
+            cur_batch_size = images.shape[0]
             images_device = images.to(device, non_blocking=True)
             masks_device = masks.to(device, non_blocking=True)
 
@@ -414,11 +456,18 @@ def main() -> None:
                     with torch.autocast(device_type=device.type, enabled=autocast_enabled):
                         logits = pytorch_model(images_device)
                         batch_loss = float(loss_fn(logits, masks_device).item())
-                batch_iou = compute_batch_iou(logits.detach(), masks_device.detach(), num_classes, threshold)
+                logits_det = logits.detach()
+                masks_det = masks_device.detach()
+                batch_iou = compute_batch_iou(logits_det, masks_det, num_classes, threshold)
                 total_loss_sum += batch_loss
                 total_iou_sum += batch_iou
                 batch_count += 1
                 iterator.set_postfix(loss=f"{batch_loss:.4f}", IoU=f"{batch_iou:.4f}")
+
+                img_ious = compute_per_image_iou(logits_det, masks_det, num_classes, threshold)
+                for i, iou_val in enumerate(img_ious):
+                    name = val_dataset.samples[sample_idx + i][0].stem
+                    per_image_ious.append((name, iou_val))
             else:
                 input_name = onnx_session.get_inputs()[0].name
                 input_array = images.numpy().astype(np.float32)
@@ -428,6 +477,13 @@ def main() -> None:
                 total_iou_sum += batch_iou
                 batch_count += 1
                 iterator.set_postfix(IoU=f"{batch_iou:.4f}")
+
+                img_ious = compute_per_image_iou(logits_tensor, masks, num_classes, threshold)
+                for i, iou_val in enumerate(img_ious):
+                    name = val_dataset.samples[sample_idx + i][0].stem
+                    per_image_ious.append((name, iou_val))
+
+            sample_idx += cur_batch_size
 
     elapsed = time.time() - started_at
 
@@ -462,6 +518,49 @@ def main() -> None:
 
     print(f"{'=' * 60}")
 
+    # ------------------------------------------------------------------
+    # 低 IoU 图片统计
+    # ------------------------------------------------------------------
+    low_iou_images = [(name, iou) for name, iou in per_image_ious if iou < low_iou_thresh]
+    low_iou_images.sort(key=lambda x: x[1])
+
+    print(f"\nLow IoU detection (threshold < {low_iou_thresh:.2f}):")
+    print(f"  Total images evaluated: {len(per_image_ious)}")
+    print(f"  Images with IoU < {low_iou_thresh:.2f}: {len(low_iou_images)}")
+    if per_image_ious:
+        all_ious = [iou for _, iou in per_image_ious]
+        print(f"  IoU range: [{min(all_ious):.4f}, {max(all_ious):.4f}]")
+    if low_iou_images:
+        low_ious_only = [iou for _, iou in low_iou_images]
+        print(f"  Low IoU mean: {sum(low_ious_only) / len(low_ious_only):.4f}")
+
+    # 生成统计 TXT 文件
+    report_dir = output_dir if output_dir is not None else Path(".")
+    ensure_dir(report_dir)
+    report_path = report_dir / "low_iou_report.txt"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Low IoU Report (threshold < {low_iou_thresh:.2f})\n")
+        f.write(f"{'=' * 60}\n")
+        f.write(f"Evaluation time: {elapsed:.1f}s\n")
+        f.write(f"Total images evaluated: {len(per_image_ious)}\n")
+        f.write(f"Images with IoU < {low_iou_thresh:.2f}: {len(low_iou_images)}\n")
+        if per_image_ious:
+            all_ious = [iou for _, iou in per_image_ious]
+            f.write(f"Overall IoU range: [{min(all_ious):.4f}, {max(all_ious):.4f}]\n")
+            f.write(f"Overall IoU mean: {sum(all_ious) / len(all_ious):.4f}\n")
+        if low_iou_images:
+            low_ious_only = [iou for _, iou in low_iou_images]
+            f.write(f"Low IoU mean: {sum(low_ious_only) / len(low_ious_only):.4f}\n")
+        f.write(f"{'=' * 60}\n\n")
+        if low_iou_images:
+            f.write(f"{'Image':<60s} {'IoU':>8s}\n")
+            f.write(f"{'-' * 60} {'-' * 8}\n")
+            for name, iou in low_iou_images:
+                f.write(f"{name:<60s} {iou:>8.4f}\n")
+        else:
+            f.write("No images with IoU below the threshold.\n")
+    print(f"\nLow IoU report saved to: {report_path}")
+
     # 保存 JSON 汇总
     if output_dir is not None:
         eval_summary: dict[str, Any] = {
@@ -472,6 +571,8 @@ def main() -> None:
             "dynamic": dynamic,
             "val_loss": val_loss,
             "val_iou": val_iou,
+            "low_iou_thresh": low_iou_thresh,
+            "low_iou_count": len(low_iou_images),
         }
         if dynamic:
             eval_summary["val_iou_global"] = val_iou_global
