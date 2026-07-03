@@ -20,7 +20,6 @@
         --crop-pattern   "{stem}_{index}"                # 裁切图命名模式
 """
 
-import argparse
 import json
 import re
 from pathlib import Path
@@ -250,74 +249,25 @@ def process(
     print(f"\nDone: {total_images} image(s), {total_mapped} outline shape(s) mapped")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="将 ROI 裁切图上的 outline LabelMe 标注映射回原图坐标",
-    )
-    parser.add_argument(
-        "--images-dir",
-        type=str,
-        required=True,
-        help="原图目录",
-    )
-    parser.add_argument(
-        "--roi-dir",
-        type=str,
-        required=True,
-        help="ROI LabelMe JSON 目录（与原图同名 .json）",
-    )
-    parser.add_argument(
-        "--outline-dir",
-        type=str,
-        required=True,
-        help="裁切图上 outline LabelMe JSON 目录",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        required=True,
-        help="输出目录，保存映射后的 LabelMe JSON",
-    )
-    parser.add_argument(
-        "--crop-dir",
-        type=str,
-        default=None,
-        help="裁切图目录（可选，用于读取裁切图实际尺寸以计算缩放）",
-    )
-    parser.add_argument(
-        "--roi-label",
-        type=str,
-        default=None,
-        help="只取该 label 的 ROI shape（默认取全部 rectangle）",
-    )
-    parser.add_argument(
-        "--crop-pattern",
-        type=str,
-        default="{stem}_{index}",
-        help="裁切图命名模式，默认 '{stem}_{index}'",
-    )
-    parser.add_argument(
-        "--include-roi",
-        action="store_true",
-        default=False,
-        help="在输出 JSON 中保留原始 ROI 标注",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    process(
-        images_dir=Path(args.images_dir),
-        roi_dir=Path(args.roi_dir),
-        outline_dir=Path(args.outline_dir),
-        output_dir=Path(args.output_dir),
-        crop_dir=Path(args.crop_dir) if args.crop_dir else None,
-        roi_label=args.roi_label,
-        crop_pattern=args.crop_pattern,
-        include_roi_shapes=args.include_roi,
-    )
-
-
 if __name__ == "__main__":
-    main()
+    # ===================== 在这里修改参数 =====================
+    IMAGES_DIR = r"/path/to/original_images"       # 原图目录
+    ROI_DIR = r"/path/to/roi_jsons"                # ROI LabelMe JSON 目录（与原图同名 .json）
+    OUTLINE_DIR = r"/path/to/outline_jsons"        # 裁切图上 outline LabelMe JSON 目录
+    OUTPUT_DIR = r"/path/to/output"                # 输出目录，保存映射后的 LabelMe JSON
+    CROP_DIR = None                                # 裁切图目录（可选，用于读取裁切图实际尺寸以计算缩放）
+    ROI_LABEL = None                               # 只取该 label 的 ROI shape（默认 None 取全部 rectangle）
+    CROP_PATTERN = "{stem}_{index}"                # 裁切图命名模式
+    INCLUDE_ROI = False                            # 在输出 JSON 中保留原始 ROI 标注
+    # =========================================================
+
+    process(
+        images_dir=Path(IMAGES_DIR),
+        roi_dir=Path(ROI_DIR),
+        outline_dir=Path(OUTLINE_DIR),
+        output_dir=Path(OUTPUT_DIR),
+        crop_dir=Path(CROP_DIR) if CROP_DIR else None,
+        roi_label=ROI_LABEL,
+        crop_pattern=CROP_PATTERN,
+        include_roi_shapes=INCLUDE_ROI,
+    )
