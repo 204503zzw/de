@@ -178,7 +178,7 @@ def process(
             for shape in roi_data.get("shapes", []):
                 output_shapes.append(dict(shape))
 
-        for roi_idx, roi_box in enumerate(roi_boxes):
+        for roi_idx, roi_box in enumerate(roi_boxes, start=1):
             crop_stem = build_crop_name(stem, roi_idx, crop_pattern)
             outline_json_path = outline_dir / f"{crop_stem}.json"
 
@@ -257,7 +257,7 @@ if __name__ == "__main__":
     OUTPUT_DIR = r"/path/to/output"                # 输出目录，保存映射后的 LabelMe JSON
     CROP_DIR = None                                # 裁切图目录（可选，用于读取裁切图实际尺寸以计算缩放）
     ROI_LABEL = None                               # 只取该 label 的 ROI shape（默认 None 取全部 rectangle）
-    CROP_PATTERN = "{stem}_{index}"                # 裁切图命名模式
+    CROP_PATTERN = "{stem}_{index}"                # 裁切图命名模式（索引从 1 开始：stem_1, stem_2, ...）
     INCLUDE_ROI = False                            # 在输出 JSON 中保留原始 ROI 标注
     # =========================================================
 
