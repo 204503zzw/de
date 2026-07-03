@@ -1,21 +1,10 @@
 """根据 low_iou_report.txt 提取低 IoU 图片及同名 JSON 文件到指定目录。
 
-用法示例::
+直接在 if __name__ == "__main__" 中修改路径参数后运行::
 
-    python extract_low_iou.py \
-        --report low_iou_report.txt \
-        --images-dir /path/to/images \
-        --json-dir /path/to/jsons \
-        --output-dir /path/to/output
-
-    # json-dir 默认与 images-dir 相同
-    python extract_low_iou.py \
-        --report low_iou_report.txt \
-        --images-dir /path/to/images \
-        --output-dir /path/to/output
+    python extract_low_iou.py
 """
 
-import argparse
 import shutil
 from pathlib import Path
 
@@ -63,24 +52,13 @@ def find_file_with_extensions(
     return None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="根据 low_iou_report.txt 提取图片和同名 JSON 文件",
-    )
-    parser.add_argument("--report", type=str, required=True,
-                        help="low_iou_report.txt 路径")
-    parser.add_argument("--images-dir", type=str, required=True,
-                        help="原始图片目录")
-    parser.add_argument("--json-dir", type=str, default=None,
-                        help="JSON 标注文件目录（默认与 images-dir 相同）")
-    parser.add_argument("--output-dir", type=str, required=True,
-                        help="输出目录，提取的文件将复制到此处")
-    args = parser.parse_args()
-
-    report_path = Path(args.report)
-    images_dir = Path(args.images_dir)
-    json_dir = Path(args.json_dir) if args.json_dir else images_dir
-    output_dir = Path(args.output_dir)
+def main(
+    report_path: Path,
+    images_dir: Path,
+    json_dir: Path | None,
+    output_dir: Path,
+) -> None:
+    json_dir = json_dir if json_dir is not None else images_dir
 
     if not report_path.exists():
         print(f"Error: report file not found: {report_path}")
@@ -143,4 +121,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # ===================== 在此处修改路径参数 =====================
+    REPORT_PATH = r"/path/to/low_iou_report.txt"      # low_iou_report.txt 路径
+    IMAGES_DIR  = r"/path/to/images"                   # 原始图片目录
+    JSON_DIR    = r"/path/to/jsons"                     # JSON 标注文件目录（设为 None 则与 IMAGES_DIR 相同）
+    OUTPUT_DIR  = r"/path/to/output"                    # 输出目录
+    # ==============================================================
+
+    main(
+        report_path=Path(REPORT_PATH),
+        images_dir=Path(IMAGES_DIR),
+        json_dir=Path(JSON_DIR) if JSON_DIR else None,
+        output_dir=Path(OUTPUT_DIR),
+    )
