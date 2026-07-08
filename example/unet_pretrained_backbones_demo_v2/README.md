@@ -27,6 +27,9 @@
 - PyTorch 推理
 - ONNX 导出
 - ONNXRuntime 推理
+- 独立验证模块（复现训练时的 val_loss / val_iou）
+- 推理时精度统计（IoU、Dice、Precision、Recall、Accuracy）
+- 动态推理模式（保持原图尺寸，避免 resize 变形）
 
 ## 1. 你拿到这份包后先做什么
 
@@ -39,6 +42,7 @@ unet_pretrained_backbones_demo_v2/
   README.md
   train_segmentation.py
   prepare_splits.py
+  evaluate.py
   infer_pytorch.py
   export_onnx.py
   infer_onnxruntime.py
@@ -62,6 +66,8 @@ unet_pretrained_backbones_demo_v2/
   - 把 `.pth` 导出成 `.onnx`
 - `infer_onnxruntime.py`
   - 使用 ONNXRuntime 做推理
+- `evaluate.py`
+  - 独立验证模块，加载模型 + 验证集计算 val_loss 和 val_iou
 - `common.py`
   - 模型构建、数据读取、可视化、checkpoint 读写等公共逻辑
 - `augmentations.py`
@@ -158,7 +164,7 @@ python prepare_splits.py ^
   --train-ratio 0.8 ^
   --val-ratio 0.2
 ```
-python prepare_splits.py --images-dir /hy-tmp/code4/3 --masks-dir /hy-tmp/code4/masks --output-dir /hy-tmp/code4 --train-ratio 0.8 --val-ratio 0.2
+
 生成后会得到：
 
 - `train.txt`
@@ -504,6 +510,76 @@ python infer_pytorch.py ^
 | `--overlay` | 关闭 | 额外保存 mask 叠加在原图上的可视化结果 |
 | `--overlay-alpha` | `0.45` | 叠加透明度，范围 `(0, 1)`，越大颜色越浓 |
 
+### 10.3 精度统计（--gt-dir）
+
+如果有 Ground Truth mask，可以在推理时同步计算精度指标：
+
+```powershell
+python infer_pytorch.py ^
+  --checkpoint C:\path\to\best.pth ^
+  --input C:\path\to\images ^
+  --output-dir C:\path\to\output ^
+  --gt-dir C:\path\to\gt_masks
+```
+
+每张图会打印 IoU、Dice、Precision、Recall、Accuracy，最后输出 Global（全局像素级）和 Mean（逐图平均）两种汇总。
+
+其中 IoU 使用与训练验证时相同的 `smp.metrics` 计算方式，其他指标使用 numpy 计算。
+
+GT mask 要求：
+
+- 灰度图（单通道）
+- 二值分割：前景像素值 = 255（白色），背景 = 0（黑色）
+- 多类分割：像素值 = 类别索引（0, 1, 2, ...）
+- 文件名需与输入图片同名（扩展名可以不同）
+
+加上 `--metrics-output` 可以将指标保存到 CSV 文件：
+
+```powershell
+python infer_pytorch.py ^
+  --checkpoint C:\path\to\best.pth ^
+  --input C:\path\to\images ^
+  --output-dir C:\path\to\output ^
+  --gt-dir C:\path\to\gt_masks ^
+  --metrics-output C:\path\to\output\metrics.csv
+```
+
+同时使用 `--overlay` 和 `--gt-dir` 时，会生成两张 overlay 图：
+
+- `{stem}_overlay.png` — 纯 mask 叠加原图
+- `{stem}_overlay_metrics.png` — 带精度指标文字的版本
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--gt-dir` | 无 | Ground truth mask 目录 |
+| `--metrics-output` | 无 | 精度指标保存路径（CSV 文件） |
+
+### 10.4 动态推理模式（--dynamic）
+
+默认推理会将图片 resize 到训练时的固定尺寸（如 640×640），可能导致宽高比变形。加上 `--dynamic` 后保持原图尺寸，仅在右下填充最少的像素让宽高对齐到模型步长（默认 32）的倍数，推理后裁回原尺寸。
+
+```powershell
+python infer_pytorch.py ^
+  --checkpoint C:\path\to\best.pth ^
+  --input C:\path\to\image_or_dir ^
+  --output-dir C:\path\to\output ^
+  --dynamic
+```
+
+处理过程（以原图 651×490 为例）：
+
+```
+原图 651×490
+  → 填充到 672×512（32 的倍数）
+  → 模型推理
+  → 裁回 651×490
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--dynamic` | 关闭 | 保持原图尺寸，仅填充到 stride 的倍数 |
+| `--stride` | `32` | 对齐步长，取决于编码器下采样层数（5 层 = 2⁵ = 32） |
+
 ## 11. 导出 ONNX
 
 ```powershell
@@ -560,7 +636,6 @@ python infer_onnxruntime.py ^
   --threshold 0.5 ^
   --save-prob
 ```
-python infer_pytorch.py --checkpoint 'G:\Program Files\训练平台版本更新\恒源云训练\气泡\guding_val\20260514_4261\code19\验证全图+验证切片\weight\best.pth' --input 'G:\Program Files\训练平台版本更新\恒源云训练\推理\fiji_' --output-dir 'G:\Program Files\训练平台版本更新\恒源云训练\推理\fiji_1' --overlay --overlay-alpha 0.2 --sahi --sahi-crop-size 320 320 --sahi-model-size 640 640 --sahi-overlap 0.25
 
 如果训练时使用了自定义预处理，也可以显式覆盖：
 
@@ -571,9 +646,83 @@ python infer_pytorch.py --checkpoint 'G:\Program Files\训练平台版本更新\
 
 其中 `--input-range 0 1` 表示先把像素从 `0~255` 缩放到 `0~1`，再做 `mean/std` 标准化，这与 ImageNet 预处理一致。
 
-`infer_onnxruntime.py` 同样支持 `--overlay` 和 `--overlay-alpha`，用法与 PyTorch 推理版本相同。
+`infer_onnxruntime.py` 同样支持 `--overlay`、`--overlay-alpha`、`--gt-dir`、`--metrics-output`、`--dynamic` 等，用法与 PyTorch 推理版本相同。
 
-## 13. 打包给别人时的建议
+## 13. 独立验证模块（evaluate.py）
+
+`evaluate.py` 是一个独立的验证模块，功能类似训练时的验证循环，但不需要训练过程。它加载模型和验证集数据，计算与训练时完全一致的 `val_loss` 和 `val_iou`。
+
+### 13.1 基本用法
+
+**PyTorch checkpoint（固定尺寸，和训练验证一致）**
+
+```bash
+python evaluate.py --checkpoint /path/to/best.pth \
+    --images-dir /path/to/images --masks-dir /path/to/masks \
+    --val-txt /path/to/val.txt
+```
+
+**ONNX 模型（需手动指定参数）**
+
+```bash
+python evaluate.py --onnx /path/to/model.onnx \
+    --images-dir /path/to/images --masks-dir /path/to/masks \
+    --val-txt /path/to/val.txt \
+    --num-classes 1 --imgsz 640 640
+```
+
+ONNX 模式下只计算 `val_iou`（没有 loss 函数），`val_loss` 显示为 nan。
+
+### 13.2 三种验证方式
+
+| 方式 | 参数 | 处理方式 | 适用场景 |
+|------|------|----------|----------|
+| 拉伸（默认） | 无额外参数 | resize 到固定 `image_size` | 和训练验证一致 |
+| 填充 | `--pad` | 原图放到固定画布，不缩放 | 避免 resize 变形 |
+| 动态 | `--dynamic` | 保持原图尺寸，补到 32 倍数 | 原始分辨率验证 |
+
+**动态模式**
+
+```bash
+python evaluate.py --checkpoint /path/to/best.pth \
+    --images-dir /path/to/images --masks-dir /path/to/masks \
+    --val-txt /path/to/val.txt --dynamic
+```
+
+动态模式保持原图尺寸，仅右下填充到 stride（默认 32）的倍数，逐张推理。无法 batch 处理（因为每张图尺寸不同），所以会比固定尺寸模式慢。
+
+### 13.3 常用参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--checkpoint` | — | PyTorch checkpoint 路径（与 `--onnx` 二选一） |
+| `--onnx` | — | ONNX 模型路径（与 `--checkpoint` 二选一） |
+| `--images-dir` | — | 图片目录 |
+| `--masks-dir` | — | GT mask 目录 |
+| `--val-txt` | — | 验证集文件列表 |
+| `--imgsz H W` | 从 checkpoint 读取 | 输入图像尺寸，可覆盖 checkpoint 中保存的值 |
+| `--batch-size` | `8` | 验证 batch size（固定尺寸模式） |
+| `--threshold` | 从 checkpoint 读取 | 二值分割阈值 |
+| `--pad` | 关闭 | 使用填充模式（默认不开启） |
+| `--pad-align` | `center` | 填充对齐方式 |
+| `--dynamic` | 关闭 | 动态推理模式 |
+| `--stride` | `32` | 动态推理时的对齐步长 |
+| `--amp` | 关闭 | 启用混合精度推理 |
+| `--output-dir` | 无 | 输出目录，保存 JSON 结果 |
+
+### 13.4 输出示例
+
+```
+============================================================
+Evaluation Summary (860 images, 22.1s)
+============================================================
+val_loss=0.1234  val_iou=0.8567
+============================================================
+```
+
+如果指定了 `--output-dir`，结果会保存到 `eval_results.json`。
+
+## 14. 打包给别人时的建议
 
 如果你准备把这套脚本直接发给别人，建议至少包含：
 
@@ -598,7 +747,7 @@ python infer_pytorch.py --checkpoint 'G:\Program Files\训练平台版本更新\
 - 自己安装依赖
 - 自己提供数据路径或模型路径
 
-## 14. 常见提醒
+## 15. 常见提醒
 
 - 不要依赖脚本内保留的历史默认路径
 - 训练时建议总是显式传入：
