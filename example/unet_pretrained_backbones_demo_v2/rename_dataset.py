@@ -2,7 +2,8 @@
 
 - 不覆盖原文件：重命名后的文件会**复制**到输出目录（默认 `renamed/`）下的
   `images/`、`labels/` 子目录中，源目录保持不变。
-- `images/` 中的图片按文件名自然排序后依次编号，编号宽度和起始编号可指定。
+- `images/` 中的图片按文件名自然排序后依次编号，编号宽度和起始编号可指定，
+  输出统一转为 PNG 格式（`00001.png`）。
 - `labels/` 目录可选：存在时与图片同名（stem 相同）的标注文件会被复制成
   相同编号，并同步更新 labelme JSON 中的 `imagePath` 字段。
 - 在输出目录生成改名前后对照的 txt 文档（默认 `rename_mapping.txt`）。
@@ -13,6 +14,8 @@ import json
 import re
 import shutil
 from pathlib import Path
+
+from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -133,7 +136,7 @@ def main() -> None:
     for offset, image in enumerate(images):
         number = args.start + offset
         new_stem = f"{number:0{args.width}d}"
-        new_image_name = f"{new_stem}{image.suffix}"
+        new_image_name = f"{new_stem}.png"
         image_plan.append((image, out_images_dir / new_image_name))
         mapping_rows.append(("image", image.name, new_image_name))
 
@@ -160,7 +163,8 @@ def main() -> None:
 
     out_images_dir.mkdir(parents=True, exist_ok=True)
     for src, dst in image_plan:
-        shutil.copy2(src, dst)
+        with Image.open(src) as img:
+            img.save(dst, format="PNG")
 
     if has_labels:
         out_labels_dir.mkdir(parents=True, exist_ok=True)
