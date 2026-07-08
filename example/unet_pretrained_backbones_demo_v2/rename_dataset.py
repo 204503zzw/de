@@ -1,13 +1,17 @@
 """按 00001、00002 ... 的顺序批量重命名 images 与 labels 目录。
 
-- `images/` 中的图片按文件名排序后依次编号，编号宽度和起始编号可指定。
-- `labels/` 目录可选：存在时与图片同名（stem 相同）的标注文件会被重命名成
+- 不覆盖原文件：重命名后的文件会**复制**到输出目录（默认 `renamed/`）下的
+  `images/`、`labels/` 子目录中，源目录保持不变。
+- `images/` 中的图片按文件名自然排序后依次编号，编号宽度和起始编号可指定。
+- `labels/` 目录可选：存在时与图片同名（stem 相同）的标注文件会被复制成
   相同编号，并同步更新 labelme JSON 中的 `imagePath` 字段。
+- 在输出目录生成改名前后对照的 txt 文档（默认 `rename_mapping.txt`）。
 """
 
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -15,7 +19,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="将 images/labels 目录下的文件重命名为 00001、00002 ...",
+        description="将 images/labels 目录下的文件重命名为 00001、00002 ...，"
+        "结果输出到独立目录并生成改名对照 txt。",
     )
     parser.add_argument(
         "--root",
@@ -25,12 +30,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--images-dir", type=str, default="images")
     parser.add_argument("--labels-dir", type=str, default="labels")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="renamed",
+        help="输出目录，重命名后的文件与对照 txt 都放这里",
+    )
+    parser.add_argument(
+        "--mapping-name",
+        type=str,
+        default="rename_mapping.txt",
+        help="改名对照 txt 的文件名（位于输出目录下）",
+    )
     parser.add_argument("--start", type=int, default=1, help="起始编号")
     parser.add_argument("--width", type=int, default=5, help="编号零填充位数")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="只打印计划的重命名，不实际改动文件",
+        help="只打印计划的重命名，不实际复制文件",
     )
     return parser.parse_args()
 
@@ -61,50 +78,28 @@ def build_label_map(labels_dir: Path) -> dict[str, list[Path]]:
     return label_map
 
 
-def update_image_path(json_path: Path, new_image_name: str) -> None:
-    """更新 labelme JSON 中的 imagePath，保留原有目录前缀。"""
+def copy_json_with_new_path(src: Path, dst: Path, new_image_name: str) -> None:
+    """把 JSON 复制到 dst，并更新其 imagePath（保留原有目录前缀）。"""
     try:
-        with json_path.open("r", encoding="utf-8") as file:
+        with src.open("r", encoding="utf-8") as file:
             data = json.load(file)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        print(f"[warn] 跳过非 JSON 或无法解析的标注文件: {json_path.name}")
+        print(f"[warn] 无法解析 JSON，按普通文件复制: {src.name}")
+        shutil.copy2(src, dst)
         return
 
-    if not isinstance(data, dict) or "imagePath" not in data:
-        return
+    if isinstance(data, dict) and "imagePath" in data:
+        old_value = data.get("imagePath")
+        if isinstance(old_value, str) and old_value:
+            # 保留目录分隔符前缀，仅替换文件名部分
+            sep_match = re.match(r"^(.*[\\/])?(.*)$", old_value)
+            directory = (sep_match.group(1) or "") if sep_match else ""
+            data["imagePath"] = f"{directory}{new_image_name}"
+        else:
+            data["imagePath"] = new_image_name
 
-    old_value = data.get("imagePath")
-    if isinstance(old_value, str) and old_value:
-        # 保留目录分隔符前缀，仅替换文件名部分
-        sep_match = re.match(r"^(.*[\\/])?(.*)$", old_value)
-        directory = (sep_match.group(1) or "") if sep_match else ""
-        data["imagePath"] = f"{directory}{new_image_name}"
-    else:
-        data["imagePath"] = new_image_name
-
-    with json_path.open("w", encoding="utf-8") as file:
+    with dst.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
-
-
-def two_phase_rename(pairs: list[tuple[Path, Path]], dry_run: bool) -> None:
-    """先改成唯一临时名，再改成目标名，避免目标名与已有文件冲突。"""
-    if dry_run:
-        for src, dst in pairs:
-            print(f"  {src.name} -> {dst.name}")
-        return
-
-    temp_pairs: list[tuple[Path, Path]] = []
-    for index, (src, dst) in enumerate(pairs):
-        if src == dst:
-            temp_pairs.append((src, dst))
-            continue
-        temp = src.with_name(f".__rename_tmp_{index}__{src.name}")
-        src.rename(temp)
-        temp_pairs.append((temp, dst))
-
-    for temp, dst in temp_pairs:
-        if temp != dst:
-            temp.rename(dst)
 
 
 def main() -> None:
@@ -115,6 +110,9 @@ def main() -> None:
     root = Path(args.root)
     images_dir = root / args.images_dir
     labels_dir = root / args.labels_dir
+    output_dir = Path(args.output_dir)
+    out_images_dir = output_dir / args.images_dir
+    out_labels_dir = output_dir / args.labels_dir
 
     if not images_dir.is_dir():
         raise FileNotFoundError(f"未找到 images 目录: {images_dir}")
@@ -126,40 +124,61 @@ def main() -> None:
     has_labels = labels_dir.is_dir()
     label_map = build_label_map(labels_dir) if has_labels else {}
 
-    image_pairs: list[tuple[Path, Path]] = []
-    label_pairs: list[tuple[Path, Path]] = []
-    json_updates: list[tuple[Path, str]] = []
+    # (源路径, 目标路径, 是否为需要更新 imagePath 的 json, 对应新图片名)
+    image_plan: list[tuple[Path, Path]] = []
+    label_plan: list[tuple[Path, Path, bool, str]] = []
+    # 对照记录: (类型, 原名, 新名)
+    mapping_rows: list[tuple[str, str, str]] = []
 
     for offset, image in enumerate(images):
         number = args.start + offset
         new_stem = f"{number:0{args.width}d}"
         new_image_name = f"{new_stem}{image.suffix}"
-        image_pairs.append((image, image.with_name(new_image_name)))
+        image_plan.append((image, out_images_dir / new_image_name))
+        mapping_rows.append(("image", image.name, new_image_name))
 
         if has_labels:
             for label in label_map.get(image.stem, []):
-                new_label = label.with_name(f"{new_stem}{label.suffix}")
-                label_pairs.append((label, new_label))
-                if label.suffix.lower() == ".json":
-                    # 记录最终 json 路径与其应写入的新图片名
-                    json_updates.append((new_label, new_image_name))
+                new_label_name = f"{new_stem}{label.suffix}"
+                is_json = label.suffix.lower() == ".json"
+                label_plan.append(
+                    (label, out_labels_dir / new_label_name, is_json, new_image_name)
+                )
+                mapping_rows.append(("label", label.name, new_label_name))
 
-    print(f"images 目录: {images_dir}  共 {len(image_pairs)} 张图片")
-    two_phase_rename(image_pairs, args.dry_run)
-
+    print(f"images 目录: {images_dir}  共 {len(image_plan)} 张图片")
     if has_labels:
-        print(f"labels 目录: {labels_dir}  共 {len(label_pairs)} 个标注文件")
-        two_phase_rename(label_pairs, args.dry_run)
-        if not args.dry_run:
-            for json_path, new_image_name in json_updates:
-                update_image_path(json_path, new_image_name)
+        print(f"labels 目录: {labels_dir}  共 {len(label_plan)} 个标注文件")
     else:
-        print("未找到 labels 目录，仅重命名图片。")
+        print("未找到 labels 目录，仅处理图片。")
 
     if args.dry_run:
-        print("[dry-run] 未对文件做任何实际改动。")
-    else:
-        print("完成。")
+        for _, old, new in mapping_rows:
+            print(f"  {old} -> {new}")
+        print("[dry-run] 未复制任何文件，也未写出对照 txt。")
+        return
+
+    out_images_dir.mkdir(parents=True, exist_ok=True)
+    for src, dst in image_plan:
+        shutil.copy2(src, dst)
+
+    if has_labels:
+        out_labels_dir.mkdir(parents=True, exist_ok=True)
+        for src, dst, is_json, new_image_name in label_plan:
+            if is_json:
+                copy_json_with_new_path(src, dst, new_image_name)
+            else:
+                shutil.copy2(src, dst)
+
+    mapping_path = output_dir / args.mapping_name
+    with mapping_path.open("w", encoding="utf-8") as file:
+        file.write("type\told_name\tnew_name\n")
+        for kind, old, new in mapping_rows:
+            file.write(f"{kind}\t{old}\t{new}\n")
+
+    print(f"输出目录: {output_dir}")
+    print(f"对照文档: {mapping_path}")
+    print("完成。")
 
 
 if __name__ == "__main__":

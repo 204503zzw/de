@@ -69,8 +69,10 @@ unet_pretrained_backbones_demo_v2/
 - `rename_dataset.py`
   - 将根目录下 `images/`（及可选 `labels/`）中的文件批量重命名为 `00001`、`00002` ...
   - 起始编号（`--start`）与编号位数（`--width`）可指定
+  - **不覆盖原文件**：结果复制到输出目录（`--output-dir`，默认 `renamed/`）下的 `images/`、`labels/` 子目录
   - `labels/` 存在时与图片同名的标注同步改名，并更新 labelme JSON 的 `imagePath` 字段
-  - 示例：`python rename_dataset.py --root . --start 1 --width 5`（先加 `--dry-run` 预览）
+  - 在输出目录生成改名前后对照的 txt（`--mapping-name`，默认 `rename_mapping.txt`）
+  - 示例：`python rename_dataset.py --root . --output-dir renamed --start 1 --width 5`（先加 `--dry-run` 预览）
 
 ## 3. 环境准备
 
