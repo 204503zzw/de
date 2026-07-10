@@ -532,6 +532,14 @@ def main() -> None:
     if bool(args.pad) and image_size is None and not dynamic:
         print("Warning: --pad ignored because input size is dynamic; pass --imgsz to enable padding.")
 
+    if image_size is None and not dynamic:
+        dynamic = True
+        print(
+            f"Note: model input size is dynamic and neither --imgsz nor --dynamic was given; "
+            f"automatically padding each image to a multiple of stride={stride} to keep the "
+            f"original resolution while avoiding invalid Conv/Concat shapes on odd-sized inputs."
+        )
+
     input_images = list_input_images(args.input)
     if not input_images:
         raise FileNotFoundError(f"No input images found in {args.input}")
