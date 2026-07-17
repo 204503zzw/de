@@ -1,22 +1,39 @@
-# ONNX 推理（独立版）
+# ONNX 导出 + 推理（独立版）
 
-从 `example/unet_pretrained_backbones_demo_v2/infer_onnxruntime.py` 剥离出来的
-**纯 ONNXRuntime 推理**脚本，不依赖 `torch` / `segmentation-models-pytorch`，也不
-依赖仓库内其他模块，可整个目录复制到任意环境单独使用。
+从 `example/unet_pretrained_backbones_demo_v2/` 剥离出来的 ONNX 导出与推理脚本，
+不依赖仓库内其他模块，可整个目录复制到任意环境单独使用：
 
-只需要一个已经导出好的 `.onnx` 分割模型和待推理图片即可运行。
+- `infer_onnxruntime.py` — **纯 ONNXRuntime 推理**，只需 numpy/pillow/onnxruntime，
+  完全不需要 torch / segmentation-models-pytorch。
+- `export_onnx.py` — 把训练得到的 checkpoint (.pth) 导出为 `.onnx`。这一步**必须**
+  依赖 torch + segmentation-models-pytorch（要用模型定义重建网络再导出）。
+
+推理只需要一个已经导出好的 `.onnx` 分割模型和待推理图片即可运行。
 
 ## 依赖
 
+推理（轻量，无框架）：
+
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # numpy / pillow / onnxruntime
 ```
 
-只包含三个依赖：`numpy`、`pillow`、`onnxruntime`（GPU 环境可自行改装
-`onnxruntime-gpu`）。
+导出（需要模型框架）：
 
-> 注意：本目录只包含**推理**。把 checkpoint 导出为 `.onnx` 仍需在原工程里用
-> `export_onnx.py` 完成，因为导出需要 `torch` 和模型定义。
+```bash
+pip install -r requirements-export.txt   # torch / torchvision / smp / onnx
+```
+
+> 说明：推理端之所以不需要框架，是因为模型结构和权重都已经烘焙进 `.onnx` 文件；
+> 只有把 checkpoint 转成 `.onnx` 的导出环节才需要 torch + 模型定义。
+
+## 导出
+
+```bash
+python export_onnx.py --checkpoint best.pth --output model.onnx
+```
+
+会同时写出一份 `model.json` 兼容元数据（推理脚本并不依赖它）。
 
 ## 用法
 

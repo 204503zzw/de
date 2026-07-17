@@ -1,0 +1,5 @@
+# 仅「导出 ONNX」(export_onnx.py) 需要，比纯推理多出模型框架依赖
+torch>=2.1
+torchvision>=0.16
+segmentation-models-pytorch>=0.3.3,<0.4
+onnx>=1.13.1
