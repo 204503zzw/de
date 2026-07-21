@@ -13,6 +13,12 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 LABELME_EXTENSIONS = {".json"}
 # masks 可以是已渲染的灰度图，也可以是 LabelMe json(训练时自动栅格化)
 MASK_EXTENSIONS = IMAGE_EXTENSIONS | LABELME_EXTENSIONS
+# 解析 mask 时的目录约定：优先这些子目录里的文件，排除这些子目录里的文件。
+# 这样即使 masks-dir 指向数据集根，也不会把 images/ 里的原图误当成 mask。
+MASK_PREFER_DIRS = {"masks", "labels"}
+MASK_EXCLUDE_DIRS = {"images"}
+# 解析原图时排除这些子目录，避免把渲染好的 mask/标注误当成输入图片。
+IMAGE_EXCLUDE_DIRS = {"masks", "labels"}
 # shape_types whose points enclose a filled region
 POLYGON_LIKE = {"polygon", "linestrip", "points", None}
 DEFAULT_DECODER_CHANNELS = (256, 128, 64, 32, 16)
@@ -149,12 +155,38 @@ def scan_files(directory: str | Path, extensions: set[str] | None = None) -> lis
 def build_file_maps(
     directory: str | Path,
     extensions: set[str] | None = None,
+    prefer_parent_dirs: set[str] | None = None,
+    exclude_parent_dirs: set[str] | None = None,
 ) -> tuple[dict[str, Path], dict[str, Path]]:
+    """构建 stem/name -> 文件 的映射。
+
+    ``prefer_parent_dirs``：同名候选里，路径中出现这些目录名的优先(如 mask 优先 ``masks``/``labels``)。
+    ``exclude_parent_dirs``：路径中出现这些目录名的文件直接排除(如给 masks-dir 传根目录时排除 ``images``)。
+    """
+    directory = Path(directory)
     files = scan_files(directory, extensions)
+    prefer = {str(d) for d in (prefer_parent_dirs or set())}
+    exclude = {str(d) for d in (exclude_parent_dirs or set())}
+
+    def parent_dir_names(path: Path) -> set[str]:
+        try:
+            parts = path.relative_to(directory).parts[:-1]
+        except ValueError:
+            parts = path.parts[:-1]
+        return set(parts)
+
+    def sort_key(path: Path):
+        dirs = parent_dir_names(path)
+        preferred = bool(prefer) and bool(dirs & prefer)
+        is_json = path.suffix.lower() in LABELME_EXTENSIONS
+        # 优先目录靠前；同类里图片优先于 json(已渲染 mask 优先)；再按路径字母序稳定。
+        return (not preferred, is_json, str(path))
+
     by_name: dict[str, Path] = {}
     by_stem: dict[str, Path] = {}
-    # 同一 stem 若既有图片又有 json，优先图片(已渲染的 mask)，避免重复渲染。
-    for path in sorted(files, key=lambda p: p.suffix.lower() in LABELME_EXTENSIONS):
+    for path in sorted(files, key=sort_key):
+        if exclude and (parent_dir_names(path) & exclude):
+            continue
         by_name.setdefault(path.name, path)
         by_stem.setdefault(path.stem, path)
     return by_name, by_stem
@@ -337,8 +369,16 @@ def collect_split_pairs(
     masks_dir: str | Path,
     split_txt: str | Path,
 ) -> list[tuple[Path, Path]]:
-    image_by_name, image_by_stem = build_file_maps(images_dir)
-    mask_by_name, mask_by_stem = build_file_maps(masks_dir, MASK_EXTENSIONS)
+    image_by_name, image_by_stem = build_file_maps(
+        images_dir,
+        exclude_parent_dirs=IMAGE_EXCLUDE_DIRS,
+    )
+    mask_by_name, mask_by_stem = build_file_maps(
+        masks_dir,
+        MASK_EXTENSIONS,
+        prefer_parent_dirs=MASK_PREFER_DIRS,
+        exclude_parent_dirs=MASK_EXCLUDE_DIRS,
+    )
     mask_index = load_optional_mask_index(split_txt)
     tokens = read_split_tokens(split_txt)
     pairs = []

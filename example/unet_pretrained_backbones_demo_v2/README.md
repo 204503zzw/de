@@ -150,6 +150,19 @@ masks/
 
 因为脚本会递归扫描 `images/` 与 `masks/`。
 
+### 4.1 目录名约定（masks-dir 指向根目录时如何区分原图和 mask）
+
+`prepare_splits.py` 与训练时解析 mask 都遵循一套**目录名约定**，因此即使把 `--images-dir` / `--masks-dir`
+都指向数据集**根目录**（比如 `类别/日期/{images,labels,masks}` 这种分层布局），也不会把原图误当成 mask：
+
+- 解析 **mask** 时：**排除 `images/` 目录**里的文件；**优先 `masks/`、`labels/` 目录**里的同名文件；
+  同名候选里再"已渲染图片 > `.json`"（png 优先于 json）。
+- 解析 **原图** 时：**排除 `masks/`、`labels/` 目录**里的文件，避免把渲染好的 mask 当成输入图。
+
+所以对分层布局，`--images-dir` 和 `--masks-dir` 都可以直接填**根目录**：原图只会从 `images/` 取，
+mask 只会从 `masks/`（若已渲染）或 `labels/`（`.json`，训练时自动转）取。
+（更稳妥、且完全不依赖目录名的方式仍是 `prepare_splits.py --recursive`，它写出 `mask_index.json` 精确配对。）
+
 ## 5. 生成 train.txt / val.txt
 
 如果你还没有划分文件，可以先运行：
