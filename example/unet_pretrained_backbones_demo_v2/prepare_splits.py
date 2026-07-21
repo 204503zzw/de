@@ -3,7 +3,7 @@ import json
 import random
 from pathlib import Path
 
-from common import IMAGE_EXTENSIONS, build_file_maps, ensure_dir
+from common import IMAGE_EXTENSIONS, MASK_EXTENSIONS, build_file_maps, ensure_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def collect_flat_stems(images_dir: str, masks_dir: str):
     """原始平铺模式：images-dir / masks-dir 各自递归扫描，按 stem 求交集配对。"""
     image_by_name, image_by_stem = build_file_maps(images_dir)
-    mask_by_name, mask_by_stem = build_file_maps(masks_dir)
+    mask_by_name, mask_by_stem = build_file_maps(masks_dir, MASK_EXTENSIONS)
     common_stems = sorted(set(image_by_stem) & set(mask_by_stem))
     if not common_stems:
         raise FileNotFoundError("No matching image/mask pairs found.")
@@ -50,9 +50,14 @@ def collect_hierarchical_pairs(root: Path, images_subdir: str, masks_subdir: str
         masks_folder = images_folder.parent / masks_subdir
         mask_by_stem = {}
         if masks_folder.is_dir():
-            for mask_path in sorted(masks_folder.iterdir()):
-                if mask_path.is_file() and mask_path.suffix.lower() in IMAGE_EXTENSIONS:
-                    mask_by_stem.setdefault(mask_path.stem, mask_path)
+            # 同一 stem 若既有图片又有 LabelMe json，优先图片(已渲染的 mask)。
+            candidates = [
+                p
+                for p in masks_folder.iterdir()
+                if p.is_file() and p.suffix.lower() in MASK_EXTENSIONS
+            ]
+            for mask_path in sorted(candidates, key=lambda p: (p.suffix.lower() == ".json", p.name)):
+                mask_by_stem.setdefault(mask_path.stem, mask_path)
         for image_path in sorted(images_folder.iterdir()):
             if not (image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS):
                 continue

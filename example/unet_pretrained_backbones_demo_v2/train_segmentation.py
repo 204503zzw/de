@@ -124,6 +124,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--in-channels", type=int, default=3)
     parser.add_argument("--num-classes", type=int, default=1)
     parser.add_argument("--force-single-class", action="store_true")
+    parser.add_argument(
+        "--label-json-classes",
+        nargs="+",
+        default=None,
+        help="当 mask 是 LabelMe json 时，训练会自动栅格化成 mask。多类需按顺序给出类别名，"
+        "映射到像素值 1..N(0=背景)，train/val 必须一致；二值(单类)不用传，所有形状=前景。",
+    )
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--pad", action="store_true",
@@ -453,6 +460,7 @@ def build_dataloader(
     transform,
     pad: bool = False,
     pad_align: str = "center",
+    label_json_classes: list[str] | None = None,
 ) -> DataLoader:
     dataset = SegmentationTxtDataset(
         images_dir=images_dir,
@@ -465,6 +473,7 @@ def build_dataloader(
         transform=transform,
         pad=pad,
         pad_align=pad_align,
+        label_json_classes=label_json_classes,
     )
     return DataLoader(
         dataset,
@@ -780,6 +789,7 @@ def main() -> None:
         meta_num_classes = int(effective_num_classes)
     raw_mask_values = unet_meta.get("mask_values") if isinstance(unet_meta, dict) else None
     mask_values = [int(x) for x in list(raw_mask_values or [])] if raw_mask_values else []
+    label_json_classes = [str(x).strip() for x in (args.label_json_classes or []) if str(x).strip()] or None
 
     preprocessing = get_preprocessing_config(args.encoder_name, args.encoder_weights)
     pin_memory = device.type == "cuda"
@@ -845,6 +855,7 @@ def main() -> None:
         train_transform,
         pad=args.pad,
         pad_align=args.pad_align,
+        label_json_classes=label_json_classes,
     )
     val_loader = build_dataloader(
         images_dir,
@@ -861,6 +872,7 @@ def main() -> None:
         val_transform,
         pad=args.pad,
         pad_align=args.pad_align,
+        label_json_classes=label_json_classes,
     )
 
     save_train_batches(train_loader, preprocessing, run_dir, args.max_visual_items)
@@ -913,6 +925,7 @@ def main() -> None:
         "preprocessing": preprocessing,
         "classes": classes,
         "mask_values": mask_values,
+        "label_json_classes": list(label_json_classes or []),
         "single_cls": bool(single_cls),
         "augmentations": {
             "hflip_prob": args.hflip_prob,

@@ -22,12 +22,9 @@ import argparse
 import json
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
-from common import IMAGE_EXTENSIONS
-
-# shape_types whose points enclose a filled region
-POLYGON_LIKE = {"polygon", "linestrip", "points", None}
+from common import IMAGE_EXTENSIONS, build_labelme_class_to_value, render_labelme_mask
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,13 +48,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-subdir", type=str, default="masks", help="递归模式 mask 输出子目录名(默认 masks)。")
     parser.add_argument("--images-subdir", type=str, default="images", help="递归模式图片子目录名(用于取尺寸，默认 images)。")
     return parser.parse_args()
-
-
-def build_class_to_value(class_names):
-    """标签 -> 像素值。多类为 1..N；二值(class_names 为空)时统一用 255。"""
-    if class_names:
-        return {name: index + 1 for index, name in enumerate(class_names)}
-    return None
 
 
 def find_image_for(json_path: Path, image_dirs):
@@ -85,42 +75,6 @@ def resolve_size(data: dict, json_path: Path, image_dirs):
     return None
 
 
-def render_mask(data: dict, size, class_to_value):
-    """把 json 的 shapes 画到一张 L 模式 mask 上。返回 (mask, dropped, unknown_labels)。"""
-    width, height = size
-    mask = Image.new("L", (width, height), 0)
-    drawer = ImageDraw.Draw(mask)
-    dropped = 0
-    unknown = set()
-    for shape in data.get("shapes", []):
-        label = shape.get("label")
-        points = shape.get("points", [])
-        shape_type = shape.get("shape_type", "polygon")
-
-        if class_to_value is None:
-            value = 255
-        elif label in class_to_value:
-            value = class_to_value[label]
-        else:
-            unknown.add(label)
-            dropped += 1
-            continue
-
-        tuples = [(float(x), float(y)) for x, y in points]
-        if shape_type == "rectangle" and len(tuples) == 2:
-            (x0, y0), (x1, y1) = tuples
-            drawer.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=value)
-        elif shape_type == "circle" and len(tuples) == 2:
-            (cx, cy), (px, py) = tuples
-            radius = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
-            drawer.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=value)
-        elif shape_type in POLYGON_LIKE and len(tuples) >= 3:
-            drawer.polygon(tuples, fill=value)
-        else:
-            dropped += 1
-    return mask, dropped, unknown
-
-
 def iter_jobs(args):
     """产出 (json_path, output_mask_path, image_dirs) 三元组。"""
     if args.recursive:
@@ -145,7 +99,7 @@ def iter_jobs(args):
 
 def main() -> None:
     args = parse_args()
-    class_to_value = build_class_to_value(args.class_names)
+    class_to_value = build_labelme_class_to_value(args.class_names)
 
     written = 0
     skipped = 0
@@ -159,7 +113,7 @@ def main() -> None:
             print(f"Skip {json_path}: 无 imageWidth/Height 且找不到配对图片。")
             skipped += 1
             continue
-        mask, dropped, unknown = render_mask(data, size, class_to_value)
+        mask, dropped, unknown = render_labelme_mask(data, size, class_to_value)
         total_dropped += dropped
         all_unknown |= unknown
         mask_path.parent.mkdir(parents=True, exist_ok=True)
