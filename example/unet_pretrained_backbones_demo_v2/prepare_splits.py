@@ -3,7 +3,15 @@ import json
 import random
 from pathlib import Path
 
-from common import IMAGE_EXTENSIONS, MASK_EXTENSIONS, build_file_maps, ensure_dir
+from common import (
+    IMAGE_EXCLUDE_DIRS,
+    IMAGE_EXTENSIONS,
+    MASK_EXCLUDE_DIRS,
+    MASK_EXTENSIONS,
+    MASK_PREFER_DIRS,
+    build_file_maps,
+    ensure_dir,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +37,16 @@ def parse_args() -> argparse.Namespace:
 
 def collect_flat_stems(images_dir: str, masks_dir: str):
     """原始平铺模式：images-dir / masks-dir 各自递归扫描，按 stem 求交集配对。"""
-    image_by_name, image_by_stem = build_file_maps(images_dir)
-    mask_by_name, mask_by_stem = build_file_maps(masks_dir, MASK_EXTENSIONS)
+    image_by_name, image_by_stem = build_file_maps(
+        images_dir,
+        exclude_parent_dirs=IMAGE_EXCLUDE_DIRS,
+    )
+    mask_by_name, mask_by_stem = build_file_maps(
+        masks_dir,
+        MASK_EXTENSIONS,
+        prefer_parent_dirs=MASK_PREFER_DIRS,
+        exclude_parent_dirs=MASK_EXCLUDE_DIRS,
+    )
     common_stems = sorted(set(image_by_stem) & set(mask_by_stem))
     if not common_stems:
         raise FileNotFoundError("No matching image/mask pairs found.")
