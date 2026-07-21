@@ -22,7 +22,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw
 
 from common import IMAGE_EXTENSIONS
