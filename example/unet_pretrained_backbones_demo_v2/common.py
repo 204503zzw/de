@@ -10,6 +10,11 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import Dataset
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+LABELME_EXTENSIONS = {".json"}
+# masks 可以是已渲染的灰度图，也可以是 LabelMe json(训练时自动栅格化)
+MASK_EXTENSIONS = IMAGE_EXTENSIONS | LABELME_EXTENSIONS
+# shape_types whose points enclose a filled region
+POLYGON_LIKE = {"polygon", "linestrip", "points", None}
 DEFAULT_DECODER_CHANNELS = (256, 128, 64, 32, 16)
 ARCH_ALIASES = {
     "unet": "Unet",
@@ -131,20 +136,110 @@ def save_metrics_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({name: row.get(name) for name in fieldnames})
 
 
-def scan_files(directory: str | Path) -> list[Path]:
+def scan_files(directory: str | Path, extensions: set[str] | None = None) -> list[Path]:
     directory = Path(directory)
+    allowed = extensions if extensions is not None else IMAGE_EXTENSIONS
     return [
         path
         for path in sorted(directory.rglob("*"))
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        if path.is_file() and path.suffix.lower() in allowed
     ]
 
 
-def build_file_maps(directory: str | Path) -> tuple[dict[str, Path], dict[str, Path]]:
-    files = scan_files(directory)
-    by_name = {path.name: path for path in files}
-    by_stem = {path.stem: path for path in files}
+def build_file_maps(
+    directory: str | Path,
+    extensions: set[str] | None = None,
+) -> tuple[dict[str, Path], dict[str, Path]]:
+    files = scan_files(directory, extensions)
+    by_name: dict[str, Path] = {}
+    by_stem: dict[str, Path] = {}
+    # 同一 stem 若既有图片又有 json，优先图片(已渲染的 mask)，避免重复渲染。
+    for path in sorted(files, key=lambda p: p.suffix.lower() in LABELME_EXTENSIONS):
+        by_name.setdefault(path.name, path)
+        by_stem.setdefault(path.stem, path)
     return by_name, by_stem
+
+
+def is_labelme_json(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in LABELME_EXTENSIONS
+
+
+def build_labelme_class_to_value(class_names: list[str] | None) -> dict[str, int] | None:
+    """标签 -> 像素值。多类为 1..N；二值(class_names 为空)时返回 None(所有形状=255)。"""
+    if class_names:
+        return {str(name): index + 1 for index, name in enumerate(class_names)}
+    return None
+
+
+def resolve_labelme_size(
+    data: dict,
+    image_size: tuple[int, int] | None = None,
+) -> tuple[int, int] | None:
+    """取 (width, height)：优先 json 里的 imageWidth/Height，否则用配对图片尺寸。"""
+    width = data.get("imageWidth")
+    height = data.get("imageHeight")
+    if width and height:
+        return int(width), int(height)
+    if image_size is not None:
+        return int(image_size[0]), int(image_size[1])
+    return None
+
+
+def render_labelme_mask(
+    data: dict,
+    size: tuple[int, int],
+    class_to_value: dict[str, int] | None,
+) -> tuple[Image.Image, int, set]:
+    """把 json 的 shapes 画到一张 L 模式 mask 上。返回 (mask, dropped, unknown_labels)。"""
+    width, height = size
+    mask = Image.new("L", (width, height), 0)
+    drawer = ImageDraw.Draw(mask)
+    dropped = 0
+    unknown: set = set()
+    for shape in data.get("shapes", []):
+        label = shape.get("label")
+        points = shape.get("points", [])
+        shape_type = shape.get("shape_type", "polygon")
+
+        if class_to_value is None:
+            value = 255
+        elif label in class_to_value:
+            value = class_to_value[label]
+        else:
+            unknown.add(label)
+            dropped += 1
+            continue
+
+        tuples = [(float(x), float(y)) for x, y in points]
+        if shape_type == "rectangle" and len(tuples) == 2:
+            (x0, y0), (x1, y1) = tuples
+            drawer.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=value)
+        elif shape_type == "circle" and len(tuples) == 2:
+            (cx, cy), (px, py) = tuples
+            radius = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+            drawer.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=value)
+        elif shape_type in POLYGON_LIKE and len(tuples) >= 3:
+            drawer.polygon(tuples, fill=value)
+        else:
+            dropped += 1
+    return mask, dropped, unknown
+
+
+def load_labelme_mask_image(
+    json_path: str | Path,
+    class_to_value: dict[str, int] | None,
+    image_size: tuple[int, int] | None = None,
+) -> Image.Image:
+    """读取 LabelMe json 并栅格化成 L 模式 mask(训练时自动转 mask 的入口)。
+
+    ``image_size`` 是配对图片的 (width, height)，用于 json 缺 imageWidth/Height 时兜底。
+    """
+    data = load_json(json_path)
+    size = resolve_labelme_size(data, image_size)
+    if size is None:
+        raise ValueError(f"LabelMe json {json_path} 缺少 imageWidth/imageHeight 且无配对图片尺寸。")
+    mask, _, _ = render_labelme_mask(data, size, class_to_value)
+    return mask
 
 
 def read_split_tokens(split_txt: str | Path) -> list[str]:
@@ -243,7 +338,7 @@ def collect_split_pairs(
     split_txt: str | Path,
 ) -> list[tuple[Path, Path]]:
     image_by_name, image_by_stem = build_file_maps(images_dir)
-    mask_by_name, mask_by_stem = build_file_maps(masks_dir)
+    mask_by_name, mask_by_stem = build_file_maps(masks_dir, MASK_EXTENSIONS)
     mask_index = load_optional_mask_index(split_txt)
     tokens = read_split_tokens(split_txt)
     pairs = []
@@ -718,6 +813,7 @@ class SegmentationTxtDataset(Dataset):
         transform=None,
         pad: bool = False,
         pad_align: str = "center",
+        label_json_classes: list[str] | None = None,
     ):
         self.samples = collect_split_pairs(images_dir, masks_dir, split_txt)
         self.height, self.width = image_size
@@ -727,6 +823,8 @@ class SegmentationTxtDataset(Dataset):
         self.transform = transform
         self.pad = bool(pad)
         self.pad_align = str(pad_align or "center").strip().lower()
+        # LabelMe json 直接当 mask 时的 标签->像素值 映射(多类需显式提供，二值为 None)
+        self.label_class_to_value = build_labelme_class_to_value(label_json_classes)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -734,7 +832,10 @@ class SegmentationTxtDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         image_path, mask_path = self.samples[index]
         image = Image.open(image_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
+        if is_labelme_json(mask_path):
+            mask = load_labelme_mask_image(mask_path, self.label_class_to_value, image.size)
+        else:
+            mask = Image.open(mask_path).convert("L")
 
         if self.transform is not None:
             image, mask = self.transform(image, mask)

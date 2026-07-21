@@ -127,6 +127,10 @@ dataset/
 - `masks/` 放分割 mask
 - `train.txt` / `val.txt` 负责定义训练集与验证集
 
+`masks/` 里既可以放**已渲染好的灰度 mask（png 等）**，也可以直接放 **LabelMe `.json` 标注**。
+如果配对到的是 `.json`，训练时会**自动按原图尺寸把它栅格化成 mask**，无需先跑 `labelme_to_mask.py`。
+详见第 5.1 节。
+
 `train.txt` / `val.txt` 每行支持：
 
 - 样本 stem，例如 `0001`
@@ -165,6 +169,46 @@ python prepare_splits.py --images-dir /hy-tmp/code4/3 --masks-dir /hy-tmp/code4/
 - `val.txt`
 
 如果你的数据已经手动划分好了，也可以跳过这一步。
+
+`prepare_splits.py` 在配对 mask 时，**同时接受灰度图和 LabelMe `.json`**：
+同一个样本如果既有图片 mask 又有 `.json`，优先用图片 mask；只有 `.json` 时就把 `.json` 当作 mask 配对。
+所以你可以在**还没有渲染 mask** 的情况下直接用 `.json` 生成 `train.txt` / `val.txt`。
+
+### 5.1 训练时自动把 LabelMe json 转成 mask
+
+如果 `masks-dir`（或分层模式的 `labels/` 目录）里放的是 LabelMe `.json`，
+训练时会在读取每个样本时**自动按原图尺寸把 `.json` 栅格化成 mask**，不需要提前跑 `labelme_to_mask.py`。
+这样标注改完可以直接重新训练，省掉"重新生成 mask"这一步。
+
+- **二值（单类）分割**：不用任何额外参数，所有标注形状都会被当作前景。
+  ```powershell
+  python train_segmentation.py --num-classes 1 ^
+    --images-dir C:\path\to\images ^
+    --masks-dir C:\path\to\labels ^
+    --train-txt C:\path\to\splits\train.txt ^
+    --val-txt C:\path\to\splits\val.txt ^
+    --save-dir C:\path\to\runs
+  ```
+
+- **多类别分割**：必须用 `--label-json-classes` 按顺序给出类别名，
+  脚本会把它们映射到像素值 `1..N`（`0` 为背景），`train` / `val` 必须用**完全一致**的顺序。
+  ```powershell
+  python train_segmentation.py --num-classes 4 ^
+    --label-json-classes cat dog bird ^
+    --images-dir C:\path\to\images ^
+    --masks-dir C:\path\to\labels ^
+    --train-txt C:\path\to\splits\train.txt ^
+    --val-txt C:\path\to\splits\val.txt ^
+    --save-dir C:\path\to\runs
+  ```
+  上例中 `cat=1`、`dog=2`、`bird=3`，加上背景共 4 类，因此 `--num-classes 4`。
+  不在 `--label-json-classes` 里的标签会被忽略。
+
+说明：
+
+- 自动转换只在**内存里**进行，不会往磁盘写 `.png`；如果你想留存渲染结果，仍可单独跑 `labelme_to_mask.py`。
+- 已经渲染好的灰度 mask 与 `.json` 可以混用；同名样本优先用图片 mask。
+- `--label-json-classes` 会被记录进 `config.json`，方便复现。
 
 ## 6. 开始训练
 
@@ -231,6 +275,12 @@ python train_segmentation.py ^
 
 - `--force-single-class`
   - 强制按单类掩码训练
+
+- `--label-json-classes`
+  - 当 mask 是 LabelMe `.json` 时，训练自动栅格化用的类别顺序
+  - 多类必填，映射到像素值 `1..N`（`0`=背景），`train` / `val` 必须一致
+  - 二值（单类）不用传，所有形状都当作前景
+  - 详见第 5.1 节
 
 - `--height` / `--width`
   - 训练输入尺寸
