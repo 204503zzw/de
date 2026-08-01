@@ -83,7 +83,32 @@ def anylabeling_bbox(points, img_w, img_h, min_width=0, min_height=0):
     return x1, y1, x2, y2
 
 
-def _rings_from_geom(geom):
+def _bridge_interiors(polygon):
+    """把带洞多边形压成单个环：每个内环用一条零宽“桥”接到外环上。
+
+    LabelMe / X-AnyLabeling 的 shape 只有一个点列，无法直接表达洞；标注里通常就是用
+    这种桥接（keyhole）写法。只取 ``exterior`` 会把洞填实，所以这里把内环接回来。
+    """
+    ring = [(float(x), float(y)) for x, y in list(polygon.exterior.coords)[:-1]]
+    for interior in polygon.interiors:
+        hole = [(float(x), float(y)) for x, y in list(interior.coords)[:-1]]
+        if len(hole) < 3 or not ring:
+            continue
+        # 外环与内环上距离最近的一对顶点作为桥的两端
+        i, j = min(
+            ((i, j) for i in range(len(ring)) for j in range(len(hole))),
+            key=lambda ij: (ring[ij[0]][0] - hole[ij[1]][0]) ** 2
+            + (ring[ij[0]][1] - hole[ij[1]][1]) ** 2,
+        )
+        # 内环方向与外环相反，保证按非零环绕规则填充时留出空洞
+        hole_loop = hole[j:] + hole[:j]
+        hole_loop.reverse()
+        hole_loop = [hole_loop[-1]] + hole_loop[:-1]
+        ring = ring[: i + 1] + hole_loop + [hole_loop[0], ring[i]] + ring[i + 1:]
+    return [[x, y] for x, y in ring]
+
+
+def _rings_from_geom(geom, keep_holes=True):
     rings = []
     gt = geom.geom_type
     if gt == "Polygon":
@@ -100,12 +125,16 @@ def _rings_from_geom(geom):
     else:
         return rings
     for p in polys:
-        if not p.is_empty and p.area > 0:
+        if p.is_empty or p.area <= 0:
+            continue
+        if keep_holes and p.interiors:
+            rings.append(_bridge_interiors(p))
+        else:
             rings.append([[float(x), float(y)] for x, y in list(p.exterior.coords)[:-1]])
     return rings
 
 
-def clip_shape_to_crop(local_pts, crop_w, crop_h, shape_type, min_area=0.5):
+def clip_shape_to_crop(local_pts, crop_w, crop_h, shape_type, min_area=0.5, keep_holes=True):
     """Clip a shape (already shifted into crop-local coords) to the crop rect.
 
     Returns list of point-rings (one per resulting piece); [] -> drop the shape.
@@ -118,7 +147,7 @@ def clip_shape_to_crop(local_pts, crop_w, crop_h, shape_type, min_area=0.5):
         inter = poly.intersection(rect)
         if inter.is_empty or inter.area < min_area:
             return []
-        return _rings_from_geom(inter)
+        return _rings_from_geom(inter, keep_holes=keep_holes)
     if len(local_pts) >= 2:
         line = LineString(local_pts).intersection(rect)
         if line.is_empty:
@@ -145,6 +174,7 @@ def crop_by_outline(
     min_width=0,
     min_height=0,
     save_labels=True,
+    keep_holes=True,
 ):
     """按外轮廓多边形 bbox 裁切图片（X-AnyLabeling 方式），并同步裁剪目标(气泡)标签。
 
@@ -152,6 +182,7 @@ def crop_by_outline(
     target_labels : 需要同步保留/裁剪的标签名列表；None -> 除 roi_label 外全部保留
     min_width/min_height : 与 X-AnyLabeling 一致的最小宽高过滤
     save_labels   : 是否在裁切图旁写出裁剪后的 LabelMe JSON
+    keep_holes    : 保留多边形的空洞（内环桥接回单个点列）；False 则只取外环（洞会被填实）
     """
     roi_json_dir = Path(roi_json_dir)
     output_dir = Path(output_dir)
@@ -260,6 +291,7 @@ def crop_by_outline(
                     crop_h,
                     shape.get("shape_type", "polygon"),
                     min_area=min_area,
+                    keep_holes=keep_holes,
                 )
                 for ring in rings:
                     new_shape = copy.deepcopy(shape)
