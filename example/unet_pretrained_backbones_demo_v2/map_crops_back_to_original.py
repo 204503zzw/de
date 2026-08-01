@@ -19,16 +19,23 @@ Workflow
       M = [[sx, 0, -sx*off_x],
            [0, sy, -sy*off_y]]      # sx = crop_w / src_w, sy = crop_h / src_h
 
-- ``affine``（旋转框/四点框做了仿射拉正，warpAffine 到 w×h 的正视图）::
+- ``affine``（默认；ROI 做了仿射拉正 warpAffine），与仿射裁剪脚本 ``affine_crop`` 逐行对齐::
 
-      tl,tr,br,bl = ROI 四角（有序）
-      M = getAffineTransform([tl, tr, bl] -> [(0,0), (w,0), (0,h)])
+      tl,tr,br,bl = order_points(四角)    # tl=min(x+y), tr=min(y-x), br=max(x+y), bl=max(y-x)
+      w = round(|tr-tl|), h = round(|bl-tl|)
+      M = getAffineTransform([tl, tr, br] -> [(0,0), (w-1,0), (w-1,h-1)])
       再乘上标注尺寸/拉正尺寸的缩放
 
-``roi_mode="auto"``（默认）按 ROI 形状自动选择：``shape_type == "rotation"``、或 ROI 明显是斜的
+  两个容易踩的点：角点排序必须用上面的 min/max 规则（绕质心按角度排序在接近 45° 时会
+  整体差 90°，表现为“逆拉正角度不对”）；目标角点是 ``w-1`` / ``h-1`` 而不是 ``w`` / ``h``。
+
+``roi_mode="auto"`` 时按 ROI 形状自动选择：``shape_type == "rotation"``、或 ROI 明显是斜的
 （最小外接矩形面积 / 正外接矩形面积 < ``rotated_ratio``）-> ``affine``，否则 ``bbox``。
 ROI 是任意点数的多边形时，拉正四角取其**最小外接矩形**（纯 Python 的旋转卡壳实现，
 等价于 ``cv2.minAreaRect``）。
+
+``roi_label`` 必须与裁剪脚本的 ``roi_label`` 一致：裁剪时只对该标签的形状编号 ``_1 _2 ...``，
+这里若把 JSON 里所有形状都算进去，索引就会错位到别的 ROI 上。
 
 纯标准库实现（PIL 仅在需要读裁剪图尺寸时可选使用），不依赖 OpenCV。
 """
@@ -200,15 +207,18 @@ def polygon_area(points):
 
 
 def order_quad(points):
-    """把四点排成 tl, tr, br, bl。"""
+    """把四点排成 tl, tr, br, bl，与裁剪脚本的 ``order_points`` 完全一致。
+
+    tl = min(x+y), tr = min(y-x), br = max(x+y), bl = max(y-x)。
+    注意不能改成“绕质心按角度排序 + 选起点”，那样在接近 45° 时会整体差 90°，
+    逆变换的旋转角就对不上。
+    """
     pts = [(float(p[0]), float(p[1])) for p in points]
-    cx = sum(p[0] for p in pts) / 4.0
-    cy = sum(p[1] for p in pts) / 4.0
-    pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
-    # atan2 升序 = 从 -pi 开始逆时针（图像坐标 y 向下即顺时针视觉），
-    # 起点旋转到离原点最近的角作为 tl
-    start = min(range(4), key=lambda i: pts[i][0] + pts[i][1])
-    return [pts[(start + i) % 4] for i in range(4)]
+    tl = min(pts, key=lambda p: p[0] + p[1])
+    tr = min(pts, key=lambda p: p[1] - p[0])
+    br = max(pts, key=lambda p: p[0] + p[1])
+    bl = max(pts, key=lambda p: p[1] - p[0])
+    return [tl, tr, br, bl]
 
 
 def is_axis_aligned(quad):
@@ -218,11 +228,11 @@ def is_axis_aligned(quad):
 
 
 def rectified_size(quad):
-    """拉正后的宽高（与 warpAffine 裁剪时一致：相邻边长度，向上取整）。"""
-    tl, tr, br, bl = quad
-    width = max(math.hypot(tr[0] - tl[0], tr[1] - tl[1]), math.hypot(br[0] - bl[0], br[1] - bl[1]))
-    height = max(math.hypot(bl[0] - tl[0], bl[1] - tl[1]), math.hypot(br[0] - tr[0], br[1] - tr[1]))
-    return int(math.ceil(width)), int(math.ceil(height))
+    """拉正后的宽高，与裁剪脚本 ``affine_crop`` 一致：四舍五入且至少 1。"""
+    tl, tr, _, bl = quad
+    width = math.hypot(tr[0] - tl[0], tr[1] - tl[1])
+    height = math.hypot(bl[0] - tl[0], bl[1] - tl[1])
+    return max(int(round(width)), 1), max(int(round(height)), 1)
 
 
 def bbox_forward_affine(bbox, bbox_mode="floor_ceil"):
@@ -241,17 +251,40 @@ def bbox_forward_affine(bbox, bbox_mode="floor_ceil"):
 
 
 def affine_forward_affine(quad):
-    """仿射拉正裁剪的正向仿射（原图 -> 拉正裁剪图）及拉正尺寸。"""
-    tl, tr, br, bl = quad
+    """仿射拉正裁剪的正向仿射（原图 -> 拉正裁剪图）及拉正尺寸。
+
+    与裁剪脚本逐行对应::
+
+        dst = [(0, 0), (w - 1, 0), (w - 1, h - 1)]
+        M   = cv2.getAffineTransform(src[:3] = [tl, tr, br], dst)
+
+    注意目标角点用的是 ``w-1`` / ``h-1``（不是 w / h），少了这一格会整体差一个
+    ``w/(w-1)`` 的尺度。
+    """
+    tl, tr, br, _ = quad
     w, h = rectified_size(quad)
-    if w <= 0 or h <= 0:
+    if w <= 1 or h <= 1:
         return None, 0, 0
-    m = affine_from_points([tl, tr, bl], [(0.0, 0.0), (float(w), 0.0), (0.0, float(h))])
+    m = affine_from_points(
+        [tl, tr, br],
+        [(0.0, 0.0), (float(w - 1), 0.0), (float(w - 1), float(h - 1))],
+    )
     return m, w, h
 
 
-def roi_quad(points):
-    """ROI 的拉正四角：四点直接排序，多边形取最小外接矩形。"""
+def rect2_to_quad(p1, p2):
+    """两点矩形 -> 四角（与裁剪脚本 ``rect2_to_4pts`` 一致）。"""
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    xmin, xmax = min(x1, x2), max(x1, x2)
+    ymin, ymax = min(y1, y2), max(y1, y2)
+    return [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]
+
+
+def roi_quad(points, shape_type="polygon"):
+    """ROI 的拉正四角，与裁剪脚本 ``roi_to_4pts`` + ``order_points`` 一致。"""
+    if shape_type == "rectangle" and len(points) == 2:
+        return order_quad(rect2_to_quad(points[0], points[1]))
     if len(points) == 4:
         return order_quad(points)
     if len(points) >= 3:
@@ -259,7 +292,7 @@ def roi_quad(points):
     return None
 
 
-def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil", rotated_ratio=0.98):
+def build_forward_transform(roi_shape, roi_mode="affine", bbox_mode="floor_ceil", rotated_ratio=0.98):
     """返回 ``(M, src_w, src_h)``，M 为原图 -> 裁剪图（未含标注端 resize）的仿射。
 
     ``roi_mode="auto"``：rotation 形状、或最小外接矩形明显小于正外接矩形
@@ -267,7 +300,7 @@ def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil", 
     """
     points = roi_shape.get("points", [])
     shape_type = roi_shape.get("shape_type", "polygon")
-    quad = roi_quad(points)
+    quad = roi_quad(points, shape_type)
 
     use_affine = False
     if roi_mode == "affine":
@@ -297,14 +330,21 @@ def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil", 
 # I/O helpers
 # --------------------------------------------------------------------------------------
 
-def load_roi_data(roi_json_dir):
-    """Load all ROI JSONs, indexed by file stem -> ``(json_data, [roi_shape, ...])``."""
+def load_roi_data(roi_json_dir, roi_label=None):
+    """Load all ROI JSONs, indexed by file stem -> ``(json_data, [roi_shape, ...])``.
+
+    *roi_label* 非空时只保留该标签的形状 —— 必须与裁剪脚本的 ``roi_label``
+    一致，否则文件名里的 ``_{idx}`` 对不上同一个 ROI。
+    """
     roi_json_dir = Path(roi_json_dir)
     roi_map = {}
     for json_path in sorted(roi_json_dir.glob("*.json")):
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        roi_map[json_path.stem] = (data, list(data.get("shapes", [])))
+        shapes = list(data.get("shapes", []))
+        if roi_label:
+            shapes = [s for s in shapes if s.get("label", "") == roi_label]
+        roi_map[json_path.stem] = (data, shapes)
     return roi_map
 
 
@@ -382,7 +422,8 @@ def run(
     keep_roi=False,
     image_dir=None,
     crop_dir=None,
-    roi_mode="auto",
+    roi_label=None,
+    roi_mode="affine",
     bbox_mode="floor_ceil",
     rotated_ratio=0.98,
 ):
@@ -393,7 +434,7 @@ def run(
     image_search_dir = Path(image_dir) if image_dir else roi_json_dir
     crop_dir = Path(crop_dir) if crop_dir else None
 
-    roi_map = load_roi_data(roi_json_dir)
+    roi_map = load_roi_data(roi_json_dir, roi_label=roi_label)
     if not roi_map:
         print(f"No ROI JSON files found in {roi_json_dir}")
         return
@@ -505,7 +546,8 @@ def parse_args():
     parser.add_argument("--image-dir", default=None, help="Directory of original images. Defaults to --roi-json-dir.")
     parser.add_argument("--crop-dir", default=None, help="Directory of cropped images, used to read crop size when the outline JSON lacks imageWidth/imageHeight.")
     parser.add_argument("--keep-roi", action="store_true", help="Keep the original ROI shapes in the output JSON.")
-    parser.add_argument("--roi-mode", default="auto", choices=["auto", "bbox", "affine"], help="Crop transform used: bbox slice, affine rectification, or auto-detect.")
+    parser.add_argument("--roi-label", default=None, help="ROI 标签名，需与裁剪脚本的 --roi-label 一致（不填则用全部形状）。")
+    parser.add_argument("--roi-mode", default="affine", choices=["auto", "bbox", "affine"], help="Crop transform used: bbox slice, affine rectification, or auto-detect.")
     parser.add_argument("--rotated-ratio", type=float, default=0.98, help="auto 模式判定 ROI 为斜框的面积比阈值（minAreaRect / bbox）。")
     parser.add_argument("--bbox-mode", default="floor_ceil", choices=["floor_ceil", "anylabeling"], help="bbox 裁剪取整方式：floor/ceil 或 X-AnyLabeling 的 int32 boundingRect。")
     return parser.parse_args()
@@ -518,6 +560,7 @@ if __name__ == "__main__":
         output_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\bubble_labels_",
         image_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\images",
         keep_roi=False,
-        roi_mode="auto",          # 斜的多边形/rotation -> 反仿射拉正（多边形取 minAreaRect）；正框 -> 正外接矩形
+        roi_label="ccs_roi",     # 必须与裁剪脚本的 roi_label 一致
+        roi_mode="affine",          # 斜的多边形/rotation -> 反仿射拉正（多边形取 minAreaRect）；正框 -> 正外接矩形
         bbox_mode="floor_ceil",   # 裁剪脚本用 X-AnyLabeling 方式时改成 "anylabeling"
     )
