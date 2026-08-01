@@ -25,8 +25,10 @@ Workflow
       M = getAffineTransform([tl, tr, bl] -> [(0,0), (w,0), (0,h)])
       再乘上标注尺寸/拉正尺寸的缩放
 
-``roi_mode="auto"``（默认）按 ROI 形状自动选择：``shape_type == "rotation"`` 或四点且
-明显非轴对齐 -> ``affine``，否则 ``bbox``。
+``roi_mode="auto"``（默认）按 ROI 形状自动选择：``shape_type == "rotation"``、或 ROI 明显是斜的
+（最小外接矩形面积 / 正外接矩形面积 < ``rotated_ratio``）-> ``affine``，否则 ``bbox``。
+ROI 是任意点数的多边形时，拉正四角取其**最小外接矩形**（纯 Python 的旋转卡壳实现，
+等价于 ``cv2.minAreaRect``）。
 
 纯标准库实现（PIL 仅在需要读裁剪图尺寸时可选使用），不依赖 OpenCV。
 """
@@ -120,6 +122,83 @@ def get_roi_bbox(shape):
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def convex_hull(points):
+    """Andrew monotone chain，返回逆时针凸包（不含重复端点）。"""
+    pts = sorted({(float(p[0]), float(p[1])) for p in points})
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def min_area_rect_quad(points):
+    """最小外接矩形的四个角（旋转卡壳：枚举凸包每条边作为矩形一边）。
+
+    与 ``cv2.minAreaRect`` + ``cv2.boxPoints`` 等价，纯标准库实现。
+    """
+    hull = convex_hull(points)
+    if len(hull) < 3:
+        return None
+
+    best = None
+    for i in range(len(hull)):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % len(hull)]
+        edge = math.hypot(x2 - x1, y2 - y1)
+        if edge < 1e-9:
+            continue
+        ux, uy = (x2 - x1) / edge, (y2 - y1) / edge
+        vx, vy = -uy, ux
+        us = [p[0] * ux + p[1] * uy for p in hull]
+        vs = [p[0] * vx + p[1] * vy for p in hull]
+        u_min, u_max = min(us), max(us)
+        v_min, v_max = min(vs), max(vs)
+        area = (u_max - u_min) * (v_max - v_min)
+        if best is None or area < best[0] - 1e-9:
+            best = (area, (ux, uy), (vx, vy), u_min, u_max, v_min, v_max)
+
+    if best is None:
+        return None
+    _, (ux, uy), (vx, vy), u_min, u_max, v_min, v_max = best
+
+    def corner(u, v):
+        return (u * ux + v * vx, u * uy + v * vy)
+
+    return order_quad(
+        [
+            corner(u_min, v_min),
+            corner(u_max, v_min),
+            corner(u_max, v_max),
+            corner(u_min, v_max),
+        ]
+    )
+
+
+def polygon_area(points):
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    if len(pts) < 3:
+        return 0.0
+    total = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        total += x1 * y2 - x2 * y1
+    return abs(total) / 2.0
+
+
 def order_quad(points):
     """把四点排成 tl, tr, br, bl。"""
     pts = [(float(p[0]), float(p[1])) for p in points]
@@ -171,24 +250,42 @@ def affine_forward_affine(quad):
     return m, w, h
 
 
-def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil"):
-    """返回 ``(M, src_w, src_h)``，M 为原图 -> 裁剪图（未含标注端 resize）的仿射。"""
+def roi_quad(points):
+    """ROI 的拉正四角：四点直接排序，多边形取最小外接矩形。"""
+    if len(points) == 4:
+        return order_quad(points)
+    if len(points) >= 3:
+        return min_area_rect_quad(points)
+    return None
+
+
+def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil", rotated_ratio=0.98):
+    """返回 ``(M, src_w, src_h)``，M 为原图 -> 裁剪图（未含标注端 resize）的仿射。
+
+    ``roi_mode="auto"``：rotation 形状、或最小外接矩形明显小于正外接矩形
+    （面积比 < *rotated_ratio*，即 ROI 是斜的）时走反仿射拉正，否则走正外接矩形。
+    """
     points = roi_shape.get("points", [])
     shape_type = roi_shape.get("shape_type", "polygon")
+    quad = roi_quad(points)
 
     use_affine = False
     if roi_mode == "affine":
         use_affine = True
-    elif roi_mode == "auto":
-        if shape_type == "rotation" and len(points) == 4:
+    elif roi_mode == "auto" and quad is not None:
+        if shape_type == "rotation":
             use_affine = True
-        elif len(points) == 4 and not is_axis_aligned(order_quad(points)):
-            use_affine = True
+        elif not is_axis_aligned(quad):
+            bbox = get_roi_bbox(roi_shape)
+            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) if bbox else 0.0
+            quad_area = polygon_area(quad)
+            if bbox_area > 0 and quad_area / bbox_area < rotated_ratio:
+                use_affine = True
 
     if use_affine:
-        if len(points) != 4:
+        if quad is None:
             return None, 0, 0
-        return affine_forward_affine(order_quad(points))
+        return affine_forward_affine(quad)
 
     bbox = get_roi_bbox(roi_shape)
     if bbox is None:
@@ -287,6 +384,7 @@ def run(
     crop_dir=None,
     roi_mode="auto",
     bbox_mode="floor_ceil",
+    rotated_ratio=0.98,
 ):
     roi_json_dir = Path(roi_json_dir)
     outline_json_dir = Path(outline_json_dir)
@@ -329,7 +427,7 @@ def run(
 
         roi_shape = roi_shapes[roi_index - 1]  # 1-based -> 0-based
         forward, src_w, src_h = build_forward_transform(
-            roi_shape, roi_mode=roi_mode, bbox_mode=bbox_mode
+            roi_shape, roi_mode=roi_mode, bbox_mode=bbox_mode, rotated_ratio=rotated_ratio
         )
         if forward is None or src_w <= 0 or src_h <= 0:
             print(f"Skip {outline_json_path.name}: cannot build crop transform from ROI shape")
@@ -408,6 +506,7 @@ def parse_args():
     parser.add_argument("--crop-dir", default=None, help="Directory of cropped images, used to read crop size when the outline JSON lacks imageWidth/imageHeight.")
     parser.add_argument("--keep-roi", action="store_true", help="Keep the original ROI shapes in the output JSON.")
     parser.add_argument("--roi-mode", default="auto", choices=["auto", "bbox", "affine"], help="Crop transform used: bbox slice, affine rectification, or auto-detect.")
+    parser.add_argument("--rotated-ratio", type=float, default=0.98, help="auto 模式判定 ROI 为斜框的面积比阈值（minAreaRect / bbox）。")
     parser.add_argument("--bbox-mode", default="floor_ceil", choices=["floor_ceil", "anylabeling"], help="bbox 裁剪取整方式：floor/ceil 或 X-AnyLabeling 的 int32 boundingRect。")
     return parser.parse_args()
 
@@ -419,6 +518,6 @@ if __name__ == "__main__":
         output_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\bubble_labels_",
         image_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\images",
         keep_roi=False,
-        roi_mode="auto",          # rotation / 非轴对齐四点 -> 反仿射拉正；否则正外接矩形
+        roi_mode="auto",          # 斜的多边形/rotation -> 反仿射拉正（多边形取 minAreaRect）；正框 -> 正外接矩形
         bbox_mode="floor_ceil",   # 裁剪脚本用 X-AnyLabeling 方式时改成 "anylabeling"
     )
