@@ -8,8 +8,14 @@
 - 输出目录按标签分子目录：``<output_dir>/<label>/<图名>_<序号>-<shape_type>.jpg``，
   序号为每张图内该标签的计数（从 1 开始），默认存 jpg。
 
-相对 X-AnyLabeling 额外保留的能力（软件本身不做）：同步裁剪目标标签（默认 "bubble"），
-用 shapely 做几何交集，跨边界的气泡按裁切框正确切分，不会整条丢失，也不会像逐点 clamp 那样变形。
+相对 X-AnyLabeling 额外保留的能力（软件本身不做）：
+
+- 同步裁剪目标标签（默认 "bubble"），用 shapely 做几何交集，跨边界的气泡按裁切框正确切分，
+  不会整条丢失，也不会像逐点 clamp 那样变形；带洞多边形的内环会桥接保留，不会被填实；
+- ``crop_mode="affine"``：多边形 ROI 取 ``cv2.minAreaRect`` 做仿射拉正（warpAffine）后再裁，
+  标签用同一个矩阵变换后再裁。角点排序、``round`` 尺寸、``w-1``/``h-1`` 目标角点与回映射脚本
+  ``map_crops_back_to_original.py``（``roi_mode="affine"``）严格一致，可原样映射回原图。
+  ``crop_mode="bbox"``（默认）保持 X-AnyLabeling 的正外接矩形切片。
 
 依赖: pip install shapely opencv-python numpy
 """
@@ -81,6 +87,60 @@ def anylabeling_bbox(points, img_w, img_h, min_width=0, min_height=0):
     if x1 >= x2 or y1 >= y2:
         return None
     return x1, y1, x2, y2
+
+
+def order_points(pts):
+    """四点排序：tl=min(x+y), tr=min(y-x), br=max(x+y), bl=max(y-x)。"""
+    pts = np.array(pts, dtype=np.float32).reshape(-1, 2)
+    s = pts.sum(axis=1)
+    d = pts[:, 1] - pts[:, 0]
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    ordered[0] = pts[np.argmin(s)]
+    ordered[1] = pts[np.argmin(d)]
+    ordered[2] = pts[np.argmax(s)]
+    ordered[3] = pts[np.argmax(d)]
+    return ordered
+
+
+def roi_to_4pts(points, shape_type="polygon"):
+    """取 ROI 的四个角：两点矩形展开，四点直接用，其余多边形取 minAreaRect。"""
+    pts = np.array(points, dtype=np.float32).reshape(-1, 2)
+    if shape_type == "rectangle" and len(pts) == 2:
+        (x1, y1), (x2, y2) = pts
+        xmin, xmax = min(x1, x2), max(x1, x2)
+        ymin, ymax = min(y1, y2), max(y1, y2)
+        return np.array(
+            [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]], dtype=np.float32
+        )
+    if len(pts) == 4:
+        return pts
+    if len(pts) < 3:
+        return None
+    return cv2.boxPoints(cv2.minAreaRect(pts))
+
+
+def affine_crop_transform(points, shape_type="polygon", min_width=0, min_height=0):
+    """仿射拉正的变换矩阵与目标尺寸（原图 -> 拉正图）。
+
+    与回映射脚本 ``map_crops_back_to_original.py`` 用的是同一套约定：
+    角点按 ``order_points`` 排序，尺寸四舍五入，目标角点用 ``w-1`` / ``h-1``。
+    """
+    box = roi_to_4pts(points, shape_type)
+    if box is None:
+        return None, 0, 0
+    src = order_points(box)
+    w = int(round(float(np.linalg.norm(src[1] - src[0]))))
+    h = int(round(float(np.linalg.norm(src[3] - src[0]))))
+    if w < max(min_width, 2) or h < max(min_height, 2):
+        return None, 0, 0
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1]], dtype=np.float32)
+    return cv2.getAffineTransform(src[:3], dst), w, h
+
+
+def transform_points(points, matrix):
+    pts = np.array(points, dtype=np.float64).reshape(-1, 2)
+    ones = np.ones((len(pts), 1), dtype=np.float64)
+    return ((matrix @ np.hstack([pts, ones]).T).T).tolist()
 
 
 def _bridge_interiors(polygon):
@@ -175,6 +235,7 @@ def crop_by_outline(
     min_height=0,
     save_labels=True,
     keep_holes=True,
+    crop_mode="bbox",
 ):
     """按外轮廓多边形 bbox 裁切图片（X-AnyLabeling 方式），并同步裁剪目标(气泡)标签。
 
@@ -183,6 +244,8 @@ def crop_by_outline(
     min_width/min_height : 与 X-AnyLabeling 一致的最小宽高过滤
     save_labels   : 是否在裁切图旁写出裁剪后的 LabelMe JSON
     keep_holes    : 保留多边形的空洞（内环桥接回单个点列）；False 则只取外环（洞会被填实）
+    crop_mode     : ``"bbox"`` = X-AnyLabeling 的正外接矩形切片；``"affine"`` = 多边形取
+                    minAreaRect 做仿射拉正（warpAffine），标签用同一个矩阵变换后再裁
     """
     roi_json_dir = Path(roi_json_dir)
     output_dir = Path(output_dir)
@@ -266,15 +329,30 @@ def crop_by_outline(
             roi_pts = roi_shape.get("points", [])
             shape_type = roi_shape.get("shape_type", "polygon")
 
-            bbox = anylabeling_bbox(
-                roi_pts, img_w, img_h, min_width=min_width, min_height=min_height
-            )
-            if bbox is None:
-                continue
-            x1, y1, x2, y2 = bbox
-            crop_w, crop_h = x2 - x1, y2 - y1
-
-            cropped = image[y1:y2, x1:x2]
+            if crop_mode == "affine":
+                matrix, crop_w, crop_h = affine_crop_transform(
+                    roi_pts, shape_type, min_width=min_width, min_height=min_height
+                )
+                if matrix is None:
+                    continue
+                cropped = cv2.warpAffine(
+                    image,
+                    matrix,
+                    (crop_w, crop_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
+            else:
+                bbox = anylabeling_bbox(
+                    roi_pts, img_w, img_h, min_width=min_width, min_height=min_height
+                )
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = bbox
+                crop_w, crop_h = x2 - x1, y2 - y1
+                matrix = None
+                cropped = image[y1:y2, x1:x2]
             if cropped.size == 0:
                 continue
 
@@ -283,8 +361,11 @@ def crop_by_outline(
                 pts = shape.get("points", [])
                 if len(pts) < 2:
                     continue
-                # 平移到裁切局部坐标
-                local_pts = [[px - x1, py - y1] for px, py in pts]
+                # 变换到裁切局部坐标
+                if matrix is not None:
+                    local_pts = transform_points(pts, matrix)
+                else:
+                    local_pts = [[px - x1, py - y1] for px, py in pts]
                 rings = clip_shape_to_crop(
                     local_pts,
                     crop_w,
@@ -341,4 +422,5 @@ if __name__ == "__main__":
         image_ext=".jpg",          # X-AnyLabeling 默认存 jpg
         min_width=0,
         min_height=0,
+        crop_mode="bbox",          # "affine" = 按 minAreaRect 做仿射拉正后再裁
     )
