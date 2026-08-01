@@ -1,0 +1,424 @@
+"""Map labels annotated on cropped ROI images back to the original image coordinates.
+
+Workflow
+--------
+1. Original images have ROI (rectangle / polygon / rotation) annotations in LabelMe JSON.
+2. Each ROI was cropped into a sub-image named ``{original_stem}_{index}.png`` or
+   ``{original_stem}_{index}-{shape_type}.jpg``（X-AnyLabeling 命名），``index`` 从 1 开始，
+   与原图 JSON 中 ROI 形状顺序一致。
+3. 这些裁剪图被标注了 outline / bubble 等多边形。
+4. 本脚本把这些标注**按裁剪时所用变换的逆变换**映射回原图坐标系。
+
+反仿射（inverse affine）
+-----------------------
+裁剪有两种方式，映射回去就有两种逆变换，均写成 2x3 仿射矩阵 ``M: 原图 -> 裁剪图``，
+回映射用 ``M^-1``：
+
+- ``bbox``（正外接矩形直接切片，无旋转）::
+
+      M = [[sx, 0, -sx*off_x],
+           [0, sy, -sy*off_y]]      # sx = crop_w / src_w, sy = crop_h / src_h
+
+- ``affine``（旋转框/四点框做了仿射拉正，warpAffine 到 w×h 的正视图）::
+
+      tl,tr,br,bl = ROI 四角（有序）
+      M = getAffineTransform([tl, tr, bl] -> [(0,0), (w,0), (0,h)])
+      再乘上标注尺寸/拉正尺寸的缩放
+
+``roi_mode="auto"``（默认）按 ROI 形状自动选择：``shape_type == "rotation"`` 或四点且
+明显非轴对齐 -> ``affine``，否则 ``bbox``。
+
+纯标准库实现（PIL 仅在需要读裁剪图尺寸时可选使用），不依赖 OpenCV。
+"""
+
+import argparse
+import json
+import math
+import shutil
+from pathlib import Path
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+AXIS_ALIGNED_TOL = 1e-3
+
+
+# --------------------------------------------------------------------------------------
+# 仿射工具（2x3 矩阵，行优先: (a, b, c, d, e, f) 表示 x' = a*x + b*y + c, y' = d*x + e*y + f）
+# --------------------------------------------------------------------------------------
+
+def affine_from_points(src_pts, dst_pts):
+    """由 3 对点求仿射矩阵 src -> dst，退化时返回 None。"""
+    (x1, y1), (x2, y2), (x3, y3) = [(float(p[0]), float(p[1])) for p in src_pts]
+    det = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)
+    if abs(det) < 1e-9:
+        return None
+
+    def solve(u1, u2, u3):
+        a = ((u2 - u1) * (y3 - y1) - (u3 - u1) * (y2 - y1)) / det
+        b = ((u3 - u1) * (x2 - x1) - (u2 - u1) * (x3 - x1)) / det
+        c = u1 - a * x1 - b * y1
+        return a, b, c
+
+    a, b, c = solve(*[float(p[0]) for p in dst_pts])
+    d, e, f = solve(*[float(p[1]) for p in dst_pts])
+    return (a, b, c, d, e, f)
+
+
+def invert_affine(m):
+    """求 2x3 仿射矩阵的逆，退化时返回 None。"""
+    a, b, c, d, e, f = m
+    det = a * e - b * d
+    if abs(det) < 1e-12:
+        return None
+    ia, ib = e / det, -b / det
+    id_, ie = -d / det, a / det
+    ic = -(ia * c + ib * f)
+    if_ = -(id_ * c + ie * f)
+    return (ia, ib, ic, id_, ie, if_)
+
+
+def apply_affine(m, x, y):
+    a, b, c, d, e, f = m
+    return a * x + b * y + c, d * x + e * y + f
+
+
+def scale_affine(m, sx, sy):
+    """在 m 之后再做一次缩放: (sx, sy) ∘ m。"""
+    a, b, c, d, e, f = m
+    return (a * sx, b * sx, c * sx, d * sy, e * sy, f * sy)
+
+
+# --------------------------------------------------------------------------------------
+# ROI 解析
+# --------------------------------------------------------------------------------------
+
+def parse_cropped_filename(filename_stem):
+    """解析 ``{original_stem}_{roi_index}`` 或 ``{original_stem}_{roi_index}-{shape_type}``。
+
+    返回 ``(original_stem, roi_index)``（1-based），不匹配时返回 ``(None, None)``。
+    """
+    stem = filename_stem
+    dash = stem.rfind("-")
+    if dash > 0 and stem[dash + 1:].isalpha():
+        stem = stem[:dash]
+    idx = stem.rfind("_")
+    if idx <= 0:
+        return None, None
+    suffix = stem[idx + 1:]
+    if not suffix.isdigit():
+        return None, None
+    return stem[:idx], int(suffix)
+
+
+def get_roi_bbox(shape):
+    """Extract the bounding box ``(x_min, y_min, x_max, y_max)`` from a LabelMe shape."""
+    points = shape.get("points", [])
+    if len(points) < 2:
+        return None
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def order_quad(points):
+    """把四点排成 tl, tr, br, bl。"""
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    cx = sum(p[0] for p in pts) / 4.0
+    cy = sum(p[1] for p in pts) / 4.0
+    pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    # atan2 升序 = 从 -pi 开始逆时针（图像坐标 y 向下即顺时针视觉），
+    # 起点旋转到离原点最近的角作为 tl
+    start = min(range(4), key=lambda i: pts[i][0] + pts[i][1])
+    return [pts[(start + i) % 4] for i in range(4)]
+
+
+def is_axis_aligned(quad):
+    xs = sorted({round(p[0], 3) for p in quad})
+    ys = sorted({round(p[1], 3) for p in quad})
+    return len(xs) <= 2 and len(ys) <= 2
+
+
+def rectified_size(quad):
+    """拉正后的宽高（与 warpAffine 裁剪时一致：相邻边长度，向上取整）。"""
+    tl, tr, br, bl = quad
+    width = max(math.hypot(tr[0] - tl[0], tr[1] - tl[1]), math.hypot(br[0] - bl[0], br[1] - bl[1]))
+    height = max(math.hypot(bl[0] - tl[0], bl[1] - tl[1]), math.hypot(br[0] - tr[0], br[1] - tr[1]))
+    return int(math.ceil(width)), int(math.ceil(height))
+
+
+def bbox_forward_affine(bbox, bbox_mode="floor_ceil"):
+    """正外接矩形裁剪的正向仿射（原图 -> 裁剪图）及裁剪源区域尺寸。"""
+    x_min, y_min, x_max, y_max = bbox
+    if bbox_mode == "anylabeling":
+        # 与 X-AnyLabeling 一致: cv2.boundingRect(np.int32(points))
+        off_x, off_y = int(x_min), int(y_min)
+        src_w = int(x_max) - off_x + 1
+        src_h = int(y_max) - off_y + 1
+    else:
+        off_x, off_y = math.floor(x_min), math.floor(y_min)
+        src_w = math.ceil(x_max) - off_x
+        src_h = math.ceil(y_max) - off_y
+    return (1.0, 0.0, -float(off_x), 0.0, 1.0, -float(off_y)), src_w, src_h
+
+
+def affine_forward_affine(quad):
+    """仿射拉正裁剪的正向仿射（原图 -> 拉正裁剪图）及拉正尺寸。"""
+    tl, tr, br, bl = quad
+    w, h = rectified_size(quad)
+    if w <= 0 or h <= 0:
+        return None, 0, 0
+    m = affine_from_points([tl, tr, bl], [(0.0, 0.0), (float(w), 0.0), (0.0, float(h))])
+    return m, w, h
+
+
+def build_forward_transform(roi_shape, roi_mode="auto", bbox_mode="floor_ceil"):
+    """返回 ``(M, src_w, src_h)``，M 为原图 -> 裁剪图（未含标注端 resize）的仿射。"""
+    points = roi_shape.get("points", [])
+    shape_type = roi_shape.get("shape_type", "polygon")
+
+    use_affine = False
+    if roi_mode == "affine":
+        use_affine = True
+    elif roi_mode == "auto":
+        if shape_type == "rotation" and len(points) == 4:
+            use_affine = True
+        elif len(points) == 4 and not is_axis_aligned(order_quad(points)):
+            use_affine = True
+
+    if use_affine:
+        if len(points) != 4:
+            return None, 0, 0
+        return affine_forward_affine(order_quad(points))
+
+    bbox = get_roi_bbox(roi_shape)
+    if bbox is None:
+        return None, 0, 0
+    return bbox_forward_affine(bbox, bbox_mode=bbox_mode)
+
+
+# --------------------------------------------------------------------------------------
+# I/O helpers
+# --------------------------------------------------------------------------------------
+
+def load_roi_data(roi_json_dir):
+    """Load all ROI JSONs, indexed by file stem -> ``(json_data, [roi_shape, ...])``."""
+    roi_json_dir = Path(roi_json_dir)
+    roi_map = {}
+    for json_path in sorted(roi_json_dir.glob("*.json")):
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        roi_map[json_path.stem] = (data, list(data.get("shapes", [])))
+    return roi_map
+
+
+def get_image_size(image_path):
+    """Return ``(width, height)`` of an image, or ``None`` if it cannot be read."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(image_path) as img:
+            return img.size
+    except (OSError, ValueError):
+        return None
+
+
+def find_image_file(directory, stem):
+    """Find an image file named ``{stem}.<ext>`` inside *directory*."""
+    directory = Path(directory)
+    for suffix in IMAGE_SUFFIXES:
+        candidate = directory / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_crop_size(outline_data, crop_stem, crop_dir, src_w, src_h):
+    """标注时裁剪图的 ``(width, height)``。
+
+    优先级: outline JSON 的 imageWidth/imageHeight -> 裁剪图文件 -> 裁剪源区域尺寸（视为未缩放）。
+    """
+    crop_w = float(outline_data.get("imageWidth") or 0)
+    crop_h = float(outline_data.get("imageHeight") or 0)
+
+    if (crop_w <= 0 or crop_h <= 0) and crop_dir is not None:
+        crop_image = find_image_file(crop_dir, crop_stem)
+        if crop_image is not None:
+            size = get_image_size(crop_image)
+            if size is not None:
+                crop_w, crop_h = float(size[0]), float(size[1])
+
+    if crop_w <= 0 or crop_h <= 0:
+        crop_w, crop_h = float(src_w), float(src_h)
+
+    return crop_w, crop_h
+
+
+def map_shape(shape, inv_matrix):
+    """Return a copy of *shape* with points mapped back to original coordinates."""
+    new_shape = dict(shape)
+    mapped = []
+    for p in shape.get("points", []):
+        x, y = apply_affine(inv_matrix, float(p[0]), float(p[1]))
+        mapped.append([round(x, 2), round(y, 2)])
+    new_shape["points"] = mapped
+    return new_shape
+
+
+def find_original_image(roi_json_data, image_search_dir):
+    """Locate the original image referenced by a ROI JSON. Returns Path or None."""
+    stem = Path(roi_json_data.get("imagePath", "")).stem or None
+    if stem is None:
+        return None
+    return find_image_file(image_search_dir, stem)
+
+
+# --------------------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------------------
+
+def run(
+    roi_json_dir,
+    outline_json_dir,
+    output_dir,
+    keep_roi=False,
+    image_dir=None,
+    crop_dir=None,
+    roi_mode="auto",
+    bbox_mode="floor_ceil",
+):
+    roi_json_dir = Path(roi_json_dir)
+    outline_json_dir = Path(outline_json_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_search_dir = Path(image_dir) if image_dir else roi_json_dir
+    crop_dir = Path(crop_dir) if crop_dir else None
+
+    roi_map = load_roi_data(roi_json_dir)
+    if not roi_map:
+        print(f"No ROI JSON files found in {roi_json_dir}")
+        return
+
+    result_shapes = {}
+    matched = 0
+    skipped = 0
+
+    for outline_json_path in sorted(outline_json_dir.glob("*.json")):
+        crop_stem = outline_json_path.stem
+        original_stem, roi_index = parse_cropped_filename(crop_stem)
+        if original_stem is None or roi_index is None:
+            print(f"Skip {outline_json_path.name}: filename does not match '{{stem}}_{{index}}' pattern")
+            skipped += 1
+            continue
+
+        if original_stem not in roi_map:
+            print(f"Skip {outline_json_path.name}: no ROI JSON found for '{original_stem}'")
+            skipped += 1
+            continue
+
+        roi_data, roi_shapes = roi_map[original_stem]
+
+        if roi_index < 1 or roi_index > len(roi_shapes):
+            print(
+                f"Skip {outline_json_path.name}: ROI index {roi_index} out of range "
+                f"(original has {len(roi_shapes)} ROI shapes)"
+            )
+            skipped += 1
+            continue
+
+        roi_shape = roi_shapes[roi_index - 1]  # 1-based -> 0-based
+        forward, src_w, src_h = build_forward_transform(
+            roi_shape, roi_mode=roi_mode, bbox_mode=bbox_mode
+        )
+        if forward is None or src_w <= 0 or src_h <= 0:
+            print(f"Skip {outline_json_path.name}: cannot build crop transform from ROI shape")
+            skipped += 1
+            continue
+
+        with open(outline_json_path, "r", encoding="utf-8") as f:
+            outline_data = json.load(f)
+
+        crop_w, crop_h = resolve_crop_size(outline_data, crop_stem, crop_dir, src_w, src_h)
+        # 标注端若做过 resize，把这一步缩放并入正向仿射，再整体求逆
+        forward = scale_affine(forward, crop_w / src_w, crop_h / src_h)
+        inverse = invert_affine(forward)
+        if inverse is None:
+            print(f"Skip {outline_json_path.name}: degenerate crop transform")
+            skipped += 1
+            continue
+
+        outline_shapes = outline_data.get("shapes", [])
+        if not outline_shapes:
+            print(f"Note {outline_json_path.name}: no outline shapes found")
+
+        for shape in outline_shapes:
+            result_shapes.setdefault(original_stem, []).append(map_shape(shape, inverse))
+
+        matched += 1
+
+    written = 0
+    copied_images = 0
+    for stem, (roi_data, roi_shapes) in roi_map.items():
+        mapped_outlines = result_shapes.get(stem, [])
+        if not mapped_outlines and not keep_roi:
+            continue
+
+        output_shapes = []
+        if keep_roi:
+            output_shapes.extend(roi_shapes)
+        output_shapes.extend(mapped_outlines)
+
+        output_data = {
+            "version": roi_data.get("version", "5.0.1"),
+            "flags": roi_data.get("flags", {}),
+            "shapes": output_shapes,
+            "imagePath": roi_data.get("imagePath", ""),
+            "imageData": None,
+            "imageHeight": roi_data.get("imageHeight"),
+            "imageWidth": roi_data.get("imageWidth"),
+        }
+
+        output_path = output_dir / f"{stem}.json"
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        written += 1
+
+        src_image = find_original_image(roi_data, image_search_dir)
+        if src_image is not None:
+            dst_image = output_dir / src_image.name
+            if dst_image.resolve() != src_image.resolve():
+                shutil.copy2(src_image, dst_image)
+                copied_images += 1
+        else:
+            print(f"Warning: image not found for '{stem}', skipping image copy")
+
+    print(f"Done. matched_outlines={matched}, skipped={skipped}, written_jsons={written}, copied_images={copied_images}")
+    print(f"Output: {output_dir}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Map labels from cropped ROI images back to original image coordinates (inverse affine).",
+    )
+    parser.add_argument("--roi-json-dir", required=True, help="Directory of original image LabelMe JSONs with ROI annotations.")
+    parser.add_argument("--outline-json-dir", required=True, help="Directory of cropped ROI image LabelMe JSONs with outline annotations.")
+    parser.add_argument("--output-dir", required=True, help="Output directory for mapped LabelMe JSONs.")
+    parser.add_argument("--image-dir", default=None, help="Directory of original images. Defaults to --roi-json-dir.")
+    parser.add_argument("--crop-dir", default=None, help="Directory of cropped images, used to read crop size when the outline JSON lacks imageWidth/imageHeight.")
+    parser.add_argument("--keep-roi", action="store_true", help="Keep the original ROI shapes in the output JSON.")
+    parser.add_argument("--roi-mode", default="auto", choices=["auto", "bbox", "affine"], help="Crop transform used: bbox slice, affine rectification, or auto-detect.")
+    parser.add_argument("--bbox-mode", default="floor_ceil", choices=["floor_ceil", "anylabeling"], help="bbox 裁剪取整方式：floor/ceil 或 X-AnyLabeling 的 int32 boundingRect。")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    run(
+        roi_json_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\outline_labels",
+        outline_json_dir=r"D:\Program Files\已标注数据集\飞牛\20260718_crop\merge\labels_",
+        output_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\bubble_labels_",
+        image_dir=r"G:\Program Files\训练平台版本更新\数据集\hangda\images",
+        keep_roi=False,
+        roi_mode="auto",          # rotation / 非轴对齐四点 -> 反仿射拉正；否则正外接矩形
+        bbox_mode="floor_ceil",   # 裁剪脚本用 X-AnyLabeling 方式时改成 "anylabeling"
+    )
