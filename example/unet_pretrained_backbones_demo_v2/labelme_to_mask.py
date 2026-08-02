@@ -21,7 +21,9 @@ Two layouts are supported:
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 from PIL import Image
 
 from common import IMAGE_EXTENSIONS, build_labelme_class_to_value, render_labelme_mask
@@ -47,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-subdir", type=str, default="labels", help="递归模式 json 子目录名(默认 labels)。")
     parser.add_argument("--out-subdir", type=str, default="masks", help="递归模式 mask 输出子目录名(默认 masks)。")
     parser.add_argument("--images-subdir", type=str, default="images", help="递归模式图片子目录名(用于取尺寸，默认 images)。")
+    parser.add_argument(
+        "--report",
+        type=str,
+        default=None,
+        help="可选：把每个未转成 mask 的 json/形状及原因写入该 json 文件。",
+    )
     return parser.parse_args()
 
 
@@ -105,20 +113,45 @@ def main() -> None:
     skipped = 0
     total_dropped = 0
     all_unknown = set()
+    failures: list[dict[str, Any]] = []
+    empty_masks: list[str] = []
     for json_path, mask_path, image_dirs in iter_jobs(args):
-        with json_path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-        size = resolve_size(data, json_path, image_dirs)
-        if size is None:
-            print(f"Skip {json_path}: 无 imageWidth/Height 且找不到配对图片。")
+        try:
+            with json_path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            reason = f"json 读取/解析失败: {error}"
+            print(f"Skip {json_path}: {reason}")
+            failures.append({"json": str(json_path), "reason": reason})
             skipped += 1
             continue
-        mask, dropped, unknown = render_labelme_mask(data, size, class_to_value)
+        size = resolve_size(data, json_path, image_dirs)
+        if size is None:
+            reason = "无 imageWidth/Height 且找不到配对图片"
+            print(f"Skip {json_path}: {reason}。")
+            failures.append({"json": str(json_path), "reason": reason})
+            skipped += 1
+            continue
+        dropped_details: list[dict[str, Any]] = []
+        mask, dropped, unknown = render_labelme_mask(data, size, class_to_value, dropped_details)
         total_dropped += dropped
         all_unknown |= unknown
+        for detail in dropped_details:
+            print(
+                f"Drop {json_path} shape#{detail['index']} "
+                f"label={detail['label']!r} type={detail['shape_type']!r} "
+                f"points={detail['points']}: {detail['reason']}"
+            )
+            failures.append({"json": str(json_path), **detail})
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         mask.save(mask_path)
         written += 1
+        if not np.asarray(mask).any():
+            shape_count = len(data.get("shapes", []))
+            reason = f"生成的 mask 全黑(shapes={shape_count}, dropped={dropped})"
+            print(f"Empty {mask_path}: {reason}。")
+            empty_masks.append(str(json_path))
+            failures.append({"json": str(json_path), "reason": reason})
 
     if class_to_value is not None:
         mapping = ", ".join(f"{name}={value}" for name, value in class_to_value.items())
@@ -126,8 +159,21 @@ def main() -> None:
     if all_unknown:
         print(f"Warning: 未在 --class-names 中的标签被忽略: {sorted(all_unknown)}")
     if total_dropped:
-        print(f"Warning: {total_dropped} 个形状点数不足/类型不支持被跳过。")
-    print(f"Done. masks written={written}, skipped_json={skipped}")
+        print(f"Warning: {total_dropped} 个形状被跳过(标签未知/点数不足/类型不支持)，明细见上方 Drop 行。")
+    if empty_masks:
+        print(f"Warning: {len(empty_masks)} 个 json 生成的 mask 全黑，明细见上方 Empty 行。")
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as file:
+            json.dump(failures, file, ensure_ascii=False, indent=2)
+        print(f"Report saved: {report_path} (records={len(failures)})")
+    if written == 0 and skipped == 0:
+        print(
+            "Warning: 没有找到任何 json。递归模式请确认 --root 下存在名为 "
+            f"'{args.json_subdir}' 的子目录(用 --json-subdir 修改)。"
+        )
+    print(f"Done. masks written={written}, skipped_json={skipped}, dropped_shapes={total_dropped}, empty_masks={len(empty_masks)}")
 
 
 if __name__ == "__main__":
