@@ -221,14 +221,31 @@ def render_labelme_mask(
     data: dict,
     size: tuple[int, int],
     class_to_value: dict[str, int] | None,
+    dropped_details: list[dict[str, Any]] | None = None,
 ) -> tuple[Image.Image, int, set]:
-    """把 json 的 shapes 画到一张 L 模式 mask 上。返回 (mask, dropped, unknown_labels)。"""
+    """把 json 的 shapes 画到一张 L 模式 mask 上。返回 (mask, dropped, unknown_labels)。
+
+    ``dropped_details`` 若传入，会追加每个被跳过形状的 {index, label, shape_type, points, reason}。
+    """
     width, height = size
     mask = Image.new("L", (width, height), 0)
     drawer = ImageDraw.Draw(mask)
     dropped = 0
     unknown: set = set()
-    for shape in data.get("shapes", []):
+
+    def record(index: int, label: Any, shape_type: Any, points: list, reason: str) -> None:
+        if dropped_details is not None:
+            dropped_details.append(
+                {
+                    "index": index,
+                    "label": label,
+                    "shape_type": shape_type,
+                    "points": len(points),
+                    "reason": reason,
+                }
+            )
+
+    for index, shape in enumerate(data.get("shapes", [])):
         label = shape.get("label")
         points = shape.get("points", [])
         shape_type = shape.get("shape_type", "polygon")
@@ -240,6 +257,7 @@ def render_labelme_mask(
         else:
             unknown.add(label)
             dropped += 1
+            record(index, label, shape_type, points, f"标签 '{label}' 不在 --class-names 中")
             continue
 
         tuples = [(float(x), float(y)) for x, y in points]
@@ -254,6 +272,13 @@ def render_labelme_mask(
             drawer.polygon(tuples, fill=value)
         else:
             dropped += 1
+            record(
+                index,
+                label,
+                shape_type,
+                points,
+                f"shape_type '{shape_type}' 不支持或点数不足({len(points)})",
+            )
     return mask, dropped, unknown
 
 
