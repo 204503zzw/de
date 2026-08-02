@@ -31,6 +31,18 @@ def parse_args() -> argparse.Namespace:
         "并额外写出 mask_index.json 记录精确的 图片->mask 配对。",
     )
     parser.add_argument("--images-subdir", type=str, default="images", help="递归模式下图片子目录名(默认 images)。")
+    parser.add_argument(
+        "--train-list",
+        type=str,
+        default=None,
+        help="指定划分：train 样本名单(每行一个 stem/文件名/相对路径)，代替按 ratio 随机划分。",
+    )
+    parser.add_argument(
+        "--val-list",
+        type=str,
+        default=None,
+        help="指定划分：val 样本名单，需与 --train-list 同时使用。",
+    )
     parser.add_argument("--masks-subdir", type=str, default="labels", help="递归模式下 mask 子目录名(默认 labels)。")
     return parser.parse_args()
 
@@ -86,9 +98,57 @@ def collect_hierarchical_pairs(root: Path, images_subdir: str, masks_subdir: str
     return pairs, unmatched
 
 
+def read_name_list(path: str) -> list[str]:
+    with Path(path).open("r", encoding="utf-8-sig") as file:
+        return [line.strip() for line in file if line.strip()]
+
+
+def split_by_lists(
+    tokens: list[str],
+    train_list: str,
+    val_list: str,
+) -> tuple[set[str], set[str]]:
+    """按给定名单划分。名单里可写 stem / 文件名 / 相对路径，统一按 stem 匹配 token。"""
+    by_stem: dict[str, list[str]] = {}
+    for token in tokens:
+        by_stem.setdefault(Path(token).stem, []).append(token)
+
+    selected: dict[str, set[str]] = {}
+    for name, list_path in (("train", train_list), ("val", val_list)):
+        keep: set[str] = set()
+        missing: list[str] = []
+        for entry in read_name_list(list_path):
+            matches = by_stem.get(Path(entry).stem)
+            if not matches:
+                missing.append(entry)
+                continue
+            if len(matches) > 1:
+                raise ValueError(
+                    f"名单项 '{entry}' 对应多个样本，无法唯一匹配: {matches}。"
+                    "请在名单里改写相对路径，或先消除重名。"
+                )
+            keep.add(matches[0])
+        if missing:
+            print(f"Warning: {name} 名单中 {len(missing)} 个名字在数据集里找不到配对样本，已忽略，例如:")
+            for entry in missing[:10]:
+                print(f"  {entry}")
+        selected[name] = keep
+
+    overlap = selected["train"] & selected["val"]
+    if overlap:
+        raise ValueError(f"train/val 名单有 {len(overlap)} 个重叠样本，例如: {sorted(overlap)[:5]}")
+    unused = len(tokens) - len(selected["train"]) - len(selected["val"])
+    if unused:
+        print(f"Note: {unused} 个数据集样本不在任何名单里，不会参与训练/验证。")
+    return selected["train"], selected["val"]
+
+
 def main() -> None:
     args = parse_args()
-    if abs(args.train_ratio + args.val_ratio - 1.0) > 1e-6:
+    use_lists = bool(args.train_list or args.val_list)
+    if use_lists and not (args.train_list and args.val_list):
+        raise ValueError("--train-list 和 --val-list 需同时提供。")
+    if not use_lists and abs(args.train_ratio + args.val_ratio - 1.0) > 1e-6:
         raise ValueError("train_ratio + val_ratio must equal 1.0")
 
     output_dir = ensure_dir(args.output_dir)
@@ -109,9 +169,14 @@ def main() -> None:
                 print(f"  {image_path}")
 
         tokens = [token for token, _, _ in pairs]
-        random.Random(args.seed).shuffle(tokens)
-        train_count = int(len(tokens) * args.train_ratio)
-        train_tokens = set(tokens[:train_count])
+        if use_lists:
+            train_tokens, val_tokens = split_by_lists(tokens, args.train_list, args.val_list)
+        else:
+            shuffled = list(tokens)
+            random.Random(args.seed).shuffle(shuffled)
+            train_count = int(len(shuffled) * args.train_ratio)
+            train_tokens = set(shuffled[:train_count])
+            val_tokens = set(shuffled) - train_tokens
 
         # mask_index.json 记录 图片绝对路径 -> mask 绝对路径，训练时据此精确配对(不受同名 stem 影响)
         mask_index = {str(image_path): str(mask_path) for _, image_path, mask_path in pairs}
@@ -127,7 +192,7 @@ def main() -> None:
             return len(ordered)
 
         n_train = write_tokens(train_path, train_tokens)
-        n_val = write_tokens(val_path, set(tokens) - train_tokens)
+        n_val = write_tokens(val_path, val_tokens)
         print(f"Saved train split: {train_path}")
         print(f"Saved val split: {val_path}")
         print(f"Saved mask index: {mask_index_path}")
@@ -139,10 +204,15 @@ def main() -> None:
     if not args.masks_dir:
         raise ValueError("--masks-dir is required unless --recursive is used.")
     image_by_stem, common_stems = collect_flat_stems(args.images_dir, args.masks_dir)
-    random.Random(args.seed).shuffle(common_stems)
-    train_count = int(len(common_stems) * args.train_ratio)
-    train_stems = common_stems[:train_count]
-    val_stems = common_stems[train_count:]
+    if use_lists:
+        train_keep, val_keep = split_by_lists(common_stems, args.train_list, args.val_list)
+        train_stems = [stem for stem in common_stems if stem in train_keep]
+        val_stems = [stem for stem in common_stems if stem in val_keep]
+    else:
+        random.Random(args.seed).shuffle(common_stems)
+        train_count = int(len(common_stems) * args.train_ratio)
+        train_stems = common_stems[:train_count]
+        val_stems = common_stems[train_count:]
 
     def write_tokens(path: Path, stems: list[str]) -> None:
         with path.open("w", encoding="utf-8") as file:
