@@ -616,6 +616,37 @@ def pad_image(
     return canvas, pad_info
 
 
+def pad_image_to_stride(
+    image: Image.Image,
+    stride: int = 32,
+    fill: int = 0,
+) -> tuple[Image.Image, dict[str, int]]:
+    """保持原图尺寸，仅在右侧和下侧填充到 stride 的倍数，不缩放。
+
+    Args:
+        image: 原图
+        stride: 对齐步长（编码器下采样倍数，通常 32）
+        fill: 填充像素值
+    """
+    stride = max(1, int(stride))
+    orig_w, orig_h = image.size
+    target_w = ((orig_w + stride - 1) // stride) * stride
+    target_h = ((orig_h + stride - 1) // stride) * stride
+    pad_info = {
+        "pad_left": 0,
+        "pad_top": 0,
+        "src_left": 0,
+        "src_top": 0,
+        "copy_w": int(orig_w),
+        "copy_h": int(orig_h),
+    }
+    if target_w == orig_w and target_h == orig_h:
+        return image, pad_info
+    canvas = Image.new(image.mode, (target_w, target_h), fill)
+    canvas.paste(image, (0, 0))
+    return canvas, pad_info
+
+
 def unpad_mask(
     mask: np.ndarray,
     original_size: tuple[int, int],
@@ -1060,11 +1091,15 @@ def load_image_for_inference(
     preprocessing: dict[str, Any],
     pad: bool = False,
     pad_align: str = "center",
+    dynamic: bool = False,
+    stride: int = 32,
 ) -> tuple[torch.Tensor, tuple[int, int], dict[str, int] | None]:
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
     pad_info: dict[str, int] | None = None
-    if pad:
+    if dynamic:
+        resized, pad_info = pad_image_to_stride(image, stride)
+    elif pad:
         resized, pad_info = pad_image(image, image_size, fill=0, align=pad_align)
     else:
         resized = image.resize((image_size[1], image_size[0]), Image.Resampling.BILINEAR)
