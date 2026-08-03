@@ -462,7 +462,25 @@ python infer_pytorch.py --checkpoint C:\path\to\best.pth --input C:\path\to\imag
 - 单张图片输入
 - 整个文件夹输入
 
-### 10.1 SAHI 滑窗推理（适合高分辨率大图）
+### 10.1 动态尺寸推理（--dynamic）
+
+默认推理会把图片缩放（或按训练配置填充）到 checkpoint 里的 `image_size`。加上 `--dynamic` 后，**保持原图尺寸**，只在右侧/下侧填充到 `--stride`（默认 32）的倍数再推理，输出裁回原图尺寸，避免 resize 变形。与 `evaluate.py --dynamic`、`infer_onnxruntime.py --dynamic` 行为一致。
+
+```powershell
+python infer_pytorch.py ^
+  --checkpoint C:\path\to\best.pth ^
+  --input C:\path\to\image_or_dir ^
+  --output-dir C:\path\to\output ^
+  --dynamic
+```
+
+注意：
+
+- `--stride` 需为编码器总下采样倍数（U-Net 系列通常 32）
+- 逐张按原图尺寸推理，大图显存占用高于固定尺寸模式
+- 不能与 `--sahi` 同时使用
+
+### 10.2 SAHI 滑窗推理（适合高分辨率大图）
 
 SAHI（Slicing Aided Hyper Inference）将大图切成若干带重叠的小块，对每个小块独立推理，再把所有小块的预测概率**加权平均融合**还原成完整 mask。
 
@@ -537,7 +555,7 @@ stride = 512 × (1 - 0.2) = 409
 - 若原图本身小于 `--sahi-crop-size`，退化为单次整图推理（仍会 resize 到 `--sahi-model-size`）
 - SAHI 推理输出分辨率与原图一致，无需额外 resize
 
-### 10.2 叠加可视化（--overlay）
+### 10.3 叠加可视化（--overlay）
 
 加上 `--overlay` 后，每张图会额外保存一张将 mask 以半透明颜色叠加在原图上的可视化结果（`{stem}_overlay.png`）。
 

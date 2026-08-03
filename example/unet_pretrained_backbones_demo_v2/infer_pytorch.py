@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--threshold", type=float, default=-1.0)
+    parser.add_argument("--dynamic", action="store_true", default=False,
+                        help="动态推理：保持原图尺寸，仅填充到 stride 的倍数后推理，避免 resize 变形（不能与 --sahi 同用）")
+    parser.add_argument("--stride", type=int, default=32,
+                        help="动态推理时的对齐步长（默认 32）")
     parser.add_argument("--sahi", action="store_true", default=False,
                         help="启用 SAHI 滑窗推理，适合高分辨率大图")
     parser.add_argument("--sahi-overlap", type=float, default=0.2,
@@ -158,6 +162,17 @@ def main() -> None:
     preprocessing = checkpoint["preprocessing"]
     pad = bool(checkpoint.get("pad", False))
     pad_align = str(checkpoint.get("pad_align", "center") or "center")
+    dynamic = bool(args.dynamic)
+    stride = int(args.stride)
+    if dynamic:
+        if args.sahi:
+            raise ValueError("--dynamic 与 --sahi 不能同时使用。")
+        if stride < 1:
+            raise ValueError("--stride 必须 >= 1。")
+        print(
+            f"Dynamic inference: 保持原图尺寸，填充到 {stride} 的倍数"
+            f"（忽略 checkpoint image_size={list(image_size)}）"
+        )
 
     gt_dir = Path(args.gt_dir) if args.gt_dir else None
     if gt_dir is not None and not gt_dir.is_dir():
@@ -201,6 +216,8 @@ def main() -> None:
                 preprocessing=preprocessing,
                 pad=pad,
                 pad_align=pad_align,
+                dynamic=dynamic,
+                stride=stride,
             )
             image_tensor = image_tensor.to(device)
 
