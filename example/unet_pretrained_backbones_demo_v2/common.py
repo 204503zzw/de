@@ -217,6 +217,22 @@ def resolve_labelme_size(
     return None
 
 
+def _fill_shape(drawer: ImageDraw.ImageDraw, shape_type: Any, tuples: list, value: int) -> bool:
+    """按 shape_type 填充一个形状，返回是否画出来了(点数不足/类型不支持则 False)。"""
+    if shape_type == "rectangle" and len(tuples) == 2:
+        (x0, y0), (x1, y1) = tuples
+        drawer.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=value)
+    elif shape_type == "circle" and len(tuples) == 2:
+        (cx, cy), (px, py) = tuples
+        radius = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+        drawer.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=value)
+    elif shape_type in POLYGON_LIKE and len(tuples) >= 3:
+        drawer.polygon(tuples, fill=value)
+    else:
+        return False
+    return True
+
+
 def render_labelme_mask(
     data: dict,
     size: tuple[int, int],
@@ -225,6 +241,7 @@ def render_labelme_mask(
 ) -> tuple[Image.Image, int, set]:
     """把 json 的 shapes 画到一张 L 模式 mask 上。返回 (mask, dropped, unknown_labels)。
 
+    X-AnyLabeling 的 ``holes``(多边形内环)会从该形状里挖掉，不会被填成前景。
     ``dropped_details`` 若传入，会追加每个被跳过形状的 {index, label, shape_type, points, reason}。
     """
     width, height = size
@@ -261,16 +278,26 @@ def render_labelme_mask(
             continue
 
         tuples = [(float(x), float(y)) for x, y in points]
-        if shape_type == "rectangle" and len(tuples) == 2:
-            (x0, y0), (x1, y1) = tuples
-            drawer.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=value)
-        elif shape_type == "circle" and len(tuples) == 2:
-            (cx, cy), (px, py) = tuples
-            radius = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
-            drawer.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=value)
-        elif shape_type in POLYGON_LIKE and len(tuples) >= 3:
-            drawer.polygon(tuples, fill=value)
+        holes = [
+            [(float(x), float(y)) for x, y in hole]
+            for hole in (shape.get("holes") or [])
+        ]
+        holes = [hole for hole in holes if len(hole) >= 3]
+
+        if holes:
+            # 先把形状画进独立图层、挖掉孔洞，再合并回主 mask，
+            # 避免 fill=0 抹掉相邻形状已经画好的区域。
+            layer = Image.new("L", (width, height), 0)
+            layer_drawer = ImageDraw.Draw(layer)
+            filled = _fill_shape(layer_drawer, shape_type, tuples, 255)
+            if filled:
+                for hole in holes:
+                    layer_drawer.polygon(hole, fill=0)
+                mask.paste(value, (0, 0), layer)
         else:
+            filled = _fill_shape(drawer, shape_type, tuples, value)
+
+        if not filled:
             dropped += 1
             record(
                 index,
