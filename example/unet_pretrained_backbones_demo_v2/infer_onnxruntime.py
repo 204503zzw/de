@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -158,9 +159,17 @@ def _normalize_values(values, channels: int, fill_value: float) -> np.ndarray:
     return np.asarray(resolved, dtype=np.float32)
 
 
-def resolve_preprocessing_stats(args: argparse.Namespace, channels: int) -> tuple[np.ndarray, np.ndarray]:
+def resolve_preprocessing_stats(
+    args: argparse.Namespace,
+    channels: int,
+    preprocessing: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """命令行参数优先，其次用导出元数据的 mean/std，最后回退 ImageNet 默认值。"""
+    preprocessing = preprocessing or {}
     if args.mean:
         mean = _normalize_values(args.mean, channels=channels, fill_value=0.0)
+    elif preprocessing.get("mean") is not None:
+        mean = _normalize_values(preprocessing["mean"], channels=channels, fill_value=0.0)
     elif channels == 3:
         mean = IMAGENET_MEAN.copy()
     else:
@@ -168,12 +177,45 @@ def resolve_preprocessing_stats(args: argparse.Namespace, channels: int) -> tupl
 
     if args.std:
         std = _normalize_values(args.std, channels=channels, fill_value=1.0)
+    elif preprocessing.get("std") is not None:
+        std = _normalize_values(preprocessing["std"], channels=channels, fill_value=1.0)
     elif channels == 3:
         std = IMAGENET_STD.copy()
     else:
         std = np.ones((channels,), dtype=np.float32)
 
     return mean, std
+
+
+def load_export_metadata(
+    onnx_path: str | Path,
+    metadata_path: str | None,
+    use_metadata: bool,
+) -> dict:
+    """读取 export_onnx.py 写出的同名 json 元数据（预处理、阈值、pad、image_size 等）。
+
+    显式指定的 --metadata 缺失时报错；自动探测的同名 json 缺失时只告警并回退默认值。
+    """
+    if not use_metadata:
+        return {}
+    if metadata_path:
+        resolved = Path(metadata_path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Metadata file not found: {resolved}")
+    else:
+        resolved = Path(onnx_path).with_suffix(".json")
+        if not resolved.is_file():
+            print(
+                f"Warning: metadata {resolved} not found; using CLI/ImageNet defaults, "
+                "results may differ from infer_pytorch.py."
+            )
+            return {}
+    with open(resolved, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid metadata file (expected a JSON object): {resolved}")
+    print(f"Loaded export metadata from {resolved}")
+    return metadata
 
 
 def preprocess_image_array(
@@ -211,18 +253,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--imgsz", nargs=2, type=int, default=None)
-    parser.add_argument("--pad", action="store_true",
-                        help="不缩放，直接把原图居中放到模型尺寸画布上、不足处用黑色填充（需配合 --imgsz 或固定输入尺寸的模型）")
-    parser.add_argument("--pad-align", type=str, default="center",
+    parser.add_argument("--metadata", type=str, default=None,
+                        help="export_onnx.py 写出的元数据 json 路径，默认自动读取与 --onnx 同名的 .json")
+    parser.add_argument("--no-metadata", action="store_true", default=False,
+                        help="忽略元数据 json，只使用命令行参数与 ImageNet 默认预处理")
+    parser.add_argument("--pad", action="store_true", default=None,
+                        help="不缩放，直接把原图居中放到模型尺寸画布上、不足处用黑色填充（默认跟随元数据）")
+    parser.add_argument("--pad-align", type=str, default=None,
                         choices=["center", "top_left"],
-                        help="填充时原图的对齐方式：center 居中，top_left 放在左上角")
+                        help="填充时原图的对齐方式：center 居中，top_left 放在左上角（默认跟随元数据）")
     parser.add_argument("--dynamic", action="store_true",
                         help="动态推理：保持原图尺寸，仅填充到 stride 的倍数后推理，避免 resize 变形")
     parser.add_argument("--stride", type=int, default=32,
                         help="动态推理时的对齐步长（默认 32，适合 UNet 等 5 层下采样架构）")
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--input-space", type=str, default="RGB")
-    parser.add_argument("--input-range", nargs=2, type=float, default=[0.0, 1.0])
+    parser.add_argument("--threshold", type=float, default=-1.0,
+                        help="二分类概率阈值，默认使用元数据里的阈值（缺失时 0.5）")
+    parser.add_argument("--input-space", type=str, default=None,
+                        help="输入颜色空间 RGB/BGR，默认跟随元数据（缺失时 RGB）")
+    parser.add_argument("--input-range", nargs=2, type=float, default=None,
+                        help="输入值域，默认跟随元数据（缺失时 0 1）")
     parser.add_argument("--mean", nargs="*", type=float, default=None)
     parser.add_argument("--std", nargs="*", type=float, default=None)
     parser.add_argument("--save-prob", action="store_true", default=False)
@@ -342,7 +391,12 @@ def resolve_default_providers(ort) -> list[str]:
     return ["CPUExecutionProvider"]
 
 
-def resolve_session_config(session, args: argparse.Namespace) -> tuple[str, tuple[int, int] | None, int, int | None, np.ndarray, np.ndarray]:
+def resolve_session_config(
+    session,
+    args: argparse.Namespace,
+    metadata: dict | None = None,
+) -> tuple[str, tuple[int, int] | None, int, int | None, np.ndarray, np.ndarray]:
+    metadata = metadata or {}
     input_meta = session.get_inputs()[0]
     output_meta = session.get_outputs()[0]
     input_shape = list(input_meta.shape or [])
@@ -353,14 +407,21 @@ def resolve_session_config(session, args: argparse.Namespace) -> tuple[str, tupl
     model_width = _shape_dim_to_int(input_shape[-1]) if len(input_shape) >= 4 else None
     output_channels = _shape_dim_to_int(output_shape[1]) if len(output_shape) >= 2 else None
 
+    metadata_image_size = metadata.get("image_size")
     image_size = None
     if isinstance(args.imgsz, (list, tuple)) and len(args.imgsz) == 2:
         image_size = (int(args.imgsz[0]), int(args.imgsz[1]))
     elif model_height is not None and model_width is not None:
         image_size = (model_height, model_width)
+    elif isinstance(metadata_image_size, (list, tuple)) and len(metadata_image_size) == 2:
+        image_size = (int(metadata_image_size[0]), int(metadata_image_size[1]))
 
-    channels = int(model_channels or 3)
-    mean, std = resolve_preprocessing_stats(args, channels)
+    model_config = metadata.get("model_config") or {}
+    metadata_channels = _shape_dim_to_int(model_config.get("in_channels"))
+    channels = int(model_channels or metadata_channels or 3)
+    if output_channels is None:
+        output_channels = _shape_dim_to_int(model_config.get("num_classes"))
+    mean, std = resolve_preprocessing_stats(args, channels, metadata.get("preprocessing"))
     return input_meta.name, image_size, channels, output_channels, mean, std
 
 
@@ -521,16 +582,26 @@ def main() -> None:
 
     providers = resolve_default_providers(ort)
     output_dir = ensure_dir(args.output_dir)
+    metadata = load_export_metadata(args.onnx, args.metadata, not args.no_metadata)
+    metadata_preprocessing = metadata.get("preprocessing") or {}
     session = ort.InferenceSession(str(args.onnx), providers=providers)
-    input_name, image_size, channels, output_channels, mean, std = resolve_session_config(session, args)
-    input_space = str(args.input_space or "RGB").strip().upper()
-    input_range = (float(args.input_range[0]), float(args.input_range[1]))
+    input_name, image_size, channels, output_channels, mean, std = resolve_session_config(
+        session, args, metadata,
+    )
+    resolved_space = args.input_space or metadata_preprocessing.get("input_space") or "RGB"
+    input_space = str(resolved_space).strip().upper()
+    resolved_range = args.input_range or metadata_preprocessing.get("input_range") or [0.0, 1.0]
+    input_range = (float(resolved_range[0]), float(resolved_range[1]))
+    threshold = float(args.threshold) if args.threshold >= 0 else float(metadata.get("threshold", 0.5) or 0.5)
     dynamic = bool(args.dynamic)
     stride = int(args.stride)
-    pad = bool(args.pad) and image_size is not None
-    pad_align = str(args.pad_align or "center")
-    if bool(args.pad) and image_size is None and not dynamic:
-        print("Warning: --pad ignored because input size is dynamic; pass --imgsz to enable padding.")
+    if dynamic and stride < 1:
+        raise ValueError("--stride 必须 >= 1。")
+    requested_pad = bool(metadata.get("pad", False)) if args.pad is None else bool(args.pad)
+    pad = requested_pad and image_size is not None
+    pad_align = str(args.pad_align or metadata.get("pad_align", "center") or "center")
+    if requested_pad and image_size is None and not dynamic:
+        print("Warning: pad ignored because input size is dynamic; pass --imgsz to enable padding.")
 
     input_images = list_input_images(args.input)
     if not input_images:
@@ -543,7 +614,7 @@ def main() -> None:
             "image_size": list(image_size) if image_size is not None else "original",
             "channels": channels,
             "num_classes": int(output_channels) if output_channels is not None else "auto_from_output",
-            "threshold": float(args.threshold),
+            "threshold": threshold,
             "input_space": input_space,
             "input_range": list(input_range),
             "dynamic": dynamic,
@@ -584,7 +655,7 @@ def main() -> None:
             stride=stride,
         )
         logits = session.run(None, {input_name: input_tensor})[0]
-        mask, probability, runtime_num_classes = postprocess_output(logits, float(args.threshold))
+        mask, probability, runtime_num_classes = postprocess_output(logits, threshold)
         if pad_info is not None:
             mask = unpad_mask(mask, original_size, pad_info)
             probability = unpad_mask(probability, original_size, pad_info)

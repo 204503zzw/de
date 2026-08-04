@@ -596,7 +596,7 @@ python export_onnx.py --checkpoint C:\path\to\best.pth --output C:\path\to\model
 - `model.onnx`
 - `model.json`
 
-其中 `model.json` 仍会保留一份兼容元数据，但当前 `infer_onnxruntime.py` 已经不再依赖它。
+其中 `model.json` 记录了 `image_size`、`threshold`、`pad`/`pad_align`、`preprocessing`（`mean`/`std`/`input_space`/`input_range`）和 `model_config`。`infer_onnxruntime.py` 会自动读取与 `--onnx` 同名的 json，因此**两个文件需要放在同一目录下并保持同名**。
 
 ## 12. ONNXRuntime 推理
 
@@ -607,7 +607,18 @@ python infer_onnxruntime.py ^
   --output-dir C:\path\to\output
 ```
 
-如果训练时使用了填充模式，推理时也需要加上对应参数：
+默认行为（优先级从高到低）：
+
+- 命令行参数
+- 与 `--onnx` 同名的 `model.json`（可用 `--metadata` 指定其他路径，或 `--no-metadata` 完全忽略）
+- ONNX 输入/输出 shape（通道数、固定尺寸）
+- 内置默认值：`threshold=0.5`、`input-space=RGB`、`input-range=0 1`，以及 3 通道 RGB 的 ImageNet `mean=[0.485, 0.456, 0.406]` / `std=[0.229, 0.224, 0.225]`
+
+provider 默认优先 `CUDAExecutionProvider`，不可用时回退 `CPUExecutionProvider`。
+
+因此只要 `model.json` 在位，`pad`、`pad_align`、`threshold`、`mean`/`std`、`image_size` 都会与 `infer_pytorch.py` 从 checkpoint 读到的一致，**两个脚本（含 `--dynamic`）的结果图应该相同**。如果两边结果不一致，先对比两个脚本打印的配置：`infer_onnxruntime.py` 会打印 `Loaded export metadata from ...` 和 `Resolved config: ...`，若看到 `Warning: metadata ... not found`，说明 json 丢了，此时会回退到 ImageNet 预处理与 `0.5` 阈值，结果很可能与 PyTorch 推理不同。
+
+若需要手动指定填充模式（例如没有 json）：
 
 ```powershell
 python infer_onnxruntime.py ^
@@ -618,19 +629,7 @@ python infer_onnxruntime.py ^
   --pad-align top_left
 ```
 
-注意：`infer_pytorch.py` 会自动从 checkpoint 读取 `pad` 和 `pad_align`，无需手动指定；`infer_onnxruntime.py` 需要手动传入。
-
-默认行为：
-
-- 输入通道数从 ONNX 输入 shape 推断
-- 类别数从 ONNX 输出通道数推断
-- provider 默认优先 `CUDAExecutionProvider`，不可用时回退 `CPUExecutionProvider`
-- 对 3 通道 RGB 输入默认使用 ImageNet 预处理
-  - `mean=[0.485, 0.456, 0.406]`
-  - `std=[0.229, 0.224, 0.225]`
-  - `input-range=0 1`
-
-如果 ONNX 是动态输入，建议显式传入：
+如果 ONNX 是动态输入且没有 json，建议显式传入：
 
 ```powershell
 python infer_onnxruntime.py ^
@@ -688,5 +687,5 @@ python infer_pytorch.py --checkpoint 'G:\Program Files\训练平台版本更新\
   - `--train-txt`
   - `--val-txt`
   - `--save-dir`
-- `export_onnx.py` 会额外写出 `model.json`，但当前 `infer_onnxruntime.py` 并不依赖它
+- `export_onnx.py` 会额外写出 `model.json`，`infer_onnxruntime.py` 会自动读取它，拷贝/分发 `.onnx` 时请一并带上同名 json
 - 如果训练时使用 `imagenet` 预训练权重，第一次运行可能需要联网下载

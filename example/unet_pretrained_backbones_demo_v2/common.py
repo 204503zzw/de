@@ -1082,7 +1082,9 @@ def predict_mask_from_logits(
 
     probabilities = torch.softmax(logits, dim=1)
     mask = torch.argmax(probabilities, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
-    return mask, mask
+    confidence = probabilities.max(dim=1).values.squeeze(0).cpu().numpy()
+    probability_image = np.clip(confidence * 255.0, 0, 255).astype(np.uint8)
+    return mask, probability_image
 
 
 def load_image_for_inference(
